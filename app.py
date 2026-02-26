@@ -9,9 +9,11 @@ import pandas as pd
 import jpholiday
 from datetime import datetime, timedelta
 import pytz
-import logging
 import math
 import time
+import json
+import asyncio
+import requests_cache
 import json
 import asyncio
 
@@ -155,10 +157,15 @@ async def fetch_etfs(limit: int = 20):
             
             if code_match:
                 try:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0) # increased delay to be safer
                     ticker_symbol = f"{code_match}.T"
-                    ticker = yf.Ticker(ticker_symbol)
                     
+                    # Use requests_cache to avoid hitting the API if we just fetched this recently
+                    session = requests_cache.CachedSession('yfinance.cache')
+                    session.headers['User-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    ticker = yf.Ticker(ticker_symbol, session=session)
+                    
+                    # Fetch historical history
                     hist = await asyncio.to_thread(ticker.history, start=df_date_str(start_fetch_date), end=df_date_str(end_fetch_date))
                     
                     if not hist.empty:

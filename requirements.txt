@@ -6,3 +6,4 @@ yfinance
 pandas
 jpholiday
 gunicorn
+requests-cache
