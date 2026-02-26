@@ -1,5 +1,5 @@
 import fastapi
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 import requests
@@ -12,6 +12,8 @@ import pytz
 import logging
 import math
 import time
+import json
+import asyncio
 
 app = fastapi.FastAPI(title="ETF Viewer")
 
@@ -77,178 +79,167 @@ def format_pct_change(old_price, new_price):
     return round(pct, 2)
 
 
-@app.get("/api/fetch_etfs", response_class=JSONResponse)
+@app.get("/api/fetch_etfs")
 async def fetch_etfs(limit: int = 20):
     """
     Scrapes JPX ETF page, then fetches Yahoo Finance data for each.
-    Allows a `limit` parameter for testing to avoid huge delays.
-    Set limit=0 to fetch all (warning: slow).
+    Streams progress to the client via Server-Sent Events (SSE).
     """
-    logger = logging.getLogger("uvicorn.error")
-    
-    url = "https://www.jpx.co.jp/equities/products/etfs/issues/01.html"
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to fetch JPX page: {str(e)}"})
+    async def event_generator():
+        logger = logging.getLogger("uvicorn.error")
         
-    soup = BeautifulSoup(response.content, 'html.parser')
-    
-    # Find the main data table
-    table = soup.find('table')
-    if not table:
-         return JSONResponse(status_code=500, content={"error": "Could not find the ETF table on the JPX page."})
-         
-    tbody = table.find('tbody')
-    rows = tbody.find_all('tr') if tbody else table.find_all('tr')
-    
-    # We skip the header typically handled by thead, but if rows include header, we might start from the first data row.
-    etf_list = []
-    
-    dates = get_target_business_dates()
-    logger.info(f"Target Dates: {dates}")
-    
-    # Helper to format date for yf
-    def df_date_str(d):
-        return d.strftime('%Y-%m-%d')
+        yield f"data: {json.dumps({'type': 'info', 'message': 'JPXのサイトからETF一覧を取得しています...'})}\n\n"
         
-    # Fetch 2.5 years earlier to ensure enough data for dividends pattern prediction
-    start_fetch_date = dates['year'] - timedelta(days=550)
-    end_fetch_date = dates['target'] + timedelta(days=1)   # exclusive upper bound
-    
-    count = 0
-    for row in rows:
-        tds = row.find_all(['td', 'th'])
-        # A data row should have at least 5 columns
-        if len(tds) < 5 or tds[0].name == 'th':
-            continue
+        url = "https://www.jpx.co.jp/equities/products/etfs/issues/01.html"
+        try:
+            response = await asyncio.to_thread(requests.get, url, timeout=10)
+            response.raise_for_status()
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': f'Failed to fetch JPX page: {str(e)}'})}\n\n"
+            return
             
-        benchmark = tds[0].get_text(strip=True)
-        code_text = tds[1].get_text(strip=True)
-        name = tds[2].get_text(strip=True)
-        management = tds[3].get_text(strip=True)
-        fee = tds[4].get_text(strip=True)
+        soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Remove any extra text from code, just get the numbers. Sometimes JPX adds a letter.
-        # But Japanese ETFs in yfinance just use the 4 digit code + ".T".
-        code_match = ''.join(filter(str.isalnum, code_text))
+        table = soup.find('table')
+        if not table:
+             yield f"data: {json.dumps({'type': 'error', 'error': 'Could not find the ETF table on the JPX page.'})}\n\n"
+             return
+             
+        tbody = table.find('tbody')
+        rows = tbody.find_all('tr') if tbody else table.find_all('tr')
         
-        etf_data = {
-            "benchmark": benchmark,
-            "code": code_text,
-            "name": name,
-            "management": management,
-            "fee": fee,
-            "price": None,
-            "change_1d_pct": None,
-            "change_1w_pct": None,
-            "change_2w_pct": None,
-            "change_1y_pct": None,
-            "dividend_yield": None,
-            "dividend_date": None
-        }
+        valid_rows = [r for r in rows if len(r.find_all(['td', 'th'])) >= 5 and r.find_all(['td', 'th'])[0].name != 'th']
+        total_etfs = len(valid_rows)
+        if limit > 0:
+            total_etfs = min(total_etfs, limit)
+            
+        yield f"data: {json.dumps({'type': 'start', 'total': total_etfs})}\n\n"
         
-        if code_match:
-            try:
-                # Add a small delay to avoid hitting the rate limit too quickly
-                time.sleep(0.5)
-                
-                ticker_symbol = f"{code_match}.T"
-                
-                ticker = yf.Ticker(ticker_symbol)
-                
-                # Fetch historical history
-                hist = ticker.history(start=df_date_str(start_fetch_date), end=df_date_str(end_fetch_date))
-                
-                if not hist.empty:
-                    # Helper to get closest price on or before a target date
-                    def get_price_for_date(target_d):
-                        d_str = target_d.strftime('%Y-%m-%d')
-                        # filter up to date
-                        past_data = hist.loc[:d_str]
-                        if not past_data.empty:
-                            return past_data.iloc[-1]['Close']
-                        return None
-                        
-                    current_price = get_price_for_date(dates['target'])
-                    prev_price = get_price_for_date(dates['prev'])
-                    week_price = get_price_for_date(dates['week'])
-                    two_week_price = get_price_for_date(dates['two_weeks'])
-                    year_price = get_price_for_date(dates['year'])
+        etf_list = []
+        dates = get_target_business_dates()
+        logger.info(f"Target Dates: {dates}")
+        
+        def df_date_str(d):
+            return d.strftime('%Y-%m-%d')
+            
+        start_fetch_date = dates['year'] - timedelta(days=550)
+        end_fetch_date = dates['target'] + timedelta(days=1)
+        
+        count = 0
+        for row in valid_rows:
+            tds = row.find_all(['td', 'th'])
+            benchmark = tds[0].get_text(strip=True)
+            code_text = tds[1].get_text(strip=True)
+            name = tds[2].get_text(strip=True)
+            management = tds[3].get_text(strip=True)
+            fee = tds[4].get_text(strip=True)
+            
+            code_match = ''.join(filter(str.isalnum, code_text))
+            
+            etf_data = {
+                "benchmark": benchmark,
+                "code": code_text,
+                "name": name,
+                "management": management,
+                "fee": fee,
+                "price": None,
+                "change_1d_pct": None,
+                "change_1w_pct": None,
+                "change_2w_pct": None,
+                "change_1y_pct": None,
+                "dividend_yield": None,
+                "dividend_date": None
+            }
+            
+            yield f"data: {json.dumps({'type': 'progress', 'current': count + 1, 'total': total_etfs, 'code': code_text, 'name': name})}\n\n"
+            
+            if code_match:
+                try:
+                    await asyncio.sleep(0.5)
+                    ticker_symbol = f"{code_match}.T"
+                    ticker = yf.Ticker(ticker_symbol)
                     
-                    etf_data["price"] = round(current_price, 2) if current_price else None
-                    etf_data["change_1d_pct"] = format_pct_change(prev_price, current_price)
-                    etf_data["change_1w_pct"] = format_pct_change(week_price, current_price)
-                    etf_data["change_2w_pct"] = format_pct_change(two_week_price, current_price)
-                    etf_data["change_1y_pct"] = format_pct_change(year_price, current_price)
-                
-                # Calculate Dividend Yield and predict Next Dividend Date from history
-                etf_data["dividend_date"] = "-"
-                etf_data["dividend_yield"] = "-"
-                
-                if 'Dividends' in hist.columns:
-                    divs = hist[hist['Dividends'] > 0]
-                    if not divs.empty:
-                        # 1. Calculate yield based on trailing 12 months
-                        last_year_date = hist.index[-1] - timedelta(days=365)
-                        trailing_divs = divs[divs.index > last_year_date]
-                        annual_div = trailing_divs['Dividends'].sum()
-                        
-                        if current_price and current_price > 0 and annual_div > 0:
-                            calc_yield = (annual_div / current_price) * 100
-                            etf_data["dividend_yield"] = f"{calc_yield:.2f}%"
-                        
-                        # 2. Predict next dividend date
-                        # Get the last 2 years of dividends to find the pattern
-                        recent_divs = divs.tail(24)
-                        
-                        today = datetime.now(pytz.timezone('Asia/Tokyo'))
-                        
-                        # Gather the typical payout months
-                        payout_months = sorted(list(set([d.month for d in recent_divs.index])))
-                        
-                        # Calculate average payout day for each month
-                        avg_day_by_month = {}
-                        for m in payout_months:
-                            days = [d.day for d in recent_divs.index if d.month == m]
-                            avg_day_by_month[m] = int(sum(days) / len(days)) if days else 10
+                    hist = await asyncio.to_thread(ticker.history, start=df_date_str(start_fetch_date), end=df_date_str(end_fetch_date))
+                    
+                    if not hist.empty:
+                        def get_price_for_date(target_d):
+                            d_str = target_d.strftime('%Y-%m-%d')
+                            past_data = hist.loc[:d_str]
+                            if not past_data.empty:
+                                return float(past_data.iloc[-1]['Close'])
+                            return None
                             
-                        # Find the next month in the sequence
-                        next_month = None
-                        next_year = today.year
-                        next_day = None
+                        current_price = get_price_for_date(dates['target'])
+                        prev_price = get_price_for_date(dates['prev'])
+                        week_price = get_price_for_date(dates['week'])
+                        two_week_price = get_price_for_date(dates['two_weeks'])
+                        year_price = get_price_for_date(dates['year'])
                         
-                        for m in payout_months:
-                            if m == today.month and today.day < avg_day_by_month[m]:
-                                next_month = m
-                                next_day = avg_day_by_month[m]
-                                break
-                            elif m > today.month:
-                                next_month = m
-                                next_day = avg_day_by_month[m]
-                                break
+                        etf_data["price"] = round(current_price, 2) if current_price else None
+                        etf_data["change_1d_pct"] = format_pct_change(prev_price, current_price)
+                        etf_data["change_1w_pct"] = format_pct_change(week_price, current_price)
+                        etf_data["change_2w_pct"] = format_pct_change(two_week_price, current_price)
+                        etf_data["change_1y_pct"] = format_pct_change(year_price, current_price)
+                    
+                    etf_data["dividend_date"] = "-"
+                    etf_data["dividend_yield"] = "-"
+                    
+                    if 'Dividends' in hist.columns:
+                        divs = hist[hist['Dividends'] > 0]
+                        if not divs.empty:
+                            last_year_date = hist.index[-1] - timedelta(days=365)
+                            trailing_divs = divs[divs.index > last_year_date]
+                            annual_div = trailing_divs['Dividends'].sum()
+                            
+                            if current_price and current_price > 0 and annual_div > 0:
+                                calc_yield = (annual_div / current_price) * 100
+                                etf_data["dividend_yield"] = f"{calc_yield:.2f}%"
+                            
+                            recent_divs = divs.tail(24)
+                            today = datetime.now(pytz.timezone('Asia/Tokyo'))
+                            
+                            payout_months = sorted(list(set([d.month for d in recent_divs.index])))
+                            
+                            avg_day_by_month = {}
+                            for m in payout_months:
+                                days = [d.day for d in recent_divs.index if d.month == m]
+                                avg_day_by_month[m] = int(sum(days) / len(days)) if days else 10
                                 
-                        if not next_month:
-                            # Roll over to next year's first payout
-                            if len(payout_months) > 0:
-                                next_month = payout_months[0]
-                                next_year += 1
-                                next_day = avg_day_by_month[next_month]
-                                
-                        if next_month and next_day:
-                            etf_data["dividend_date"] = f"次回予想: {next_year}年{next_month}月{next_day}日頃"
-                        
-            except Exception as e:
-                logger.error(f"Error fetching data for {code_match}: {e}")
-                
-        etf_list.append(etf_data)
-        
-        count += 1
-        if limit > 0 and count >= limit:
-            break
+                            next_month = None
+                            next_year = today.year
+                            next_day = None
+                            
+                            for m in payout_months:
+                                if m == today.month and today.day < avg_day_by_month[m]:
+                                    next_month = m
+                                    next_day = avg_day_by_month[m]
+                                    break
+                                elif m > today.month:
+                                    next_month = m
+                                    next_day = avg_day_by_month[m]
+                                    break
+                                    
+                            if not next_month:
+                                if len(payout_months) > 0:
+                                    next_month = payout_months[0]
+                                    next_year += 1
+                                    next_day = avg_day_by_month[next_month]
+                                    
+                            if next_month and next_day:
+                                etf_data["dividend_date"] = f"次回予想: {next_year}年{next_month}月{next_day}日頃"
+                            
+                except Exception as e:
+                    logger.error(f"Error fetching data for {code_match}: {e}")
+                    
+            etf_list.append(etf_data)
+            
+            count += 1
+            if limit > 0 and count >= limit:
+                break
 
-    return {"status": "success", "data": etf_list, "target_date": dates['target'].strftime('%Y-%m-%d')}
+        yield f"data: {json.dumps({'type': 'complete', 'status': 'success', 'data': etf_list, 'target_date': dates['target'].strftime('%Y-%m-%d')})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":

@@ -41,9 +41,17 @@
             </div>
 
             <div id="loadingStatus" class="loading-status hidden">
-                <div class="spinner"></div>
-                <p>JPXスクレイピング中 & Yahoo Finance APIデータ取得中...<br><span class="small-text">(全件取得には1〜2分かかる場合があります)</span>
-                </p>
+                <div class="progress-header">
+                    <div id="loadingSpinner" class="spinner-small"></div>
+                    <span id="loadingMessage">ETFデータを取得しています...</span>
+                </div>
+                <div class="progress-container">
+                    <div id="progressBar" class="progress-bar" style="width: 0%"></div>
+                </div>
+                <div class="progress-details">
+                    <span id="progressText">準備中...</span>
+                    <span id="progressCount">0 / 0</span>
+                </div>
             </div>
 
             <div id="lastUpdated" class="last-updated hidden">

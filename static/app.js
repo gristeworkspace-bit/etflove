@@ -13,7 +13,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentData = [];
     let currentSort = { column: null, direction: 'asc' };
 
-    fetchDataBtn.addEventListener('click', async () => {
+    fetchDataBtn.addEventListener('click', () => {
         // UI Loading state
         fetchDataBtn.disabled = true;
         downloadCSVBtn.disabled = true;
@@ -27,31 +27,77 @@ document.addEventListener('DOMContentLoaded', () => {
         const isFetchAll = fetchAllToggle.checked;
         const limitParam = isFetchAll ? 0 : 20;
 
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        const progressCount = document.getElementById('progressCount');
+        const loadingMessage = document.getElementById('loadingMessage');
+
+        progressBar.style.width = '0%';
+        progressText.textContent = '準備中...';
+        progressCount.textContent = '0 / 0';
+        loadingMessage.textContent = 'ETFデータを取得しています...';
+
         try {
-            const response = await fetch(`/api/fetch_etfs?limit=${limitParam}`);
-            const data = await response.json();
+            const eventSource = new EventSource(`/api/fetch_etfs?limit=${limitParam}`);
 
-            if (data.status === 'success') {
-                currentData = data.data;
-                targetDateDisplay.textContent = data.target_date;
-                renderTable(currentData);
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
 
+                if (data.type === 'info') {
+                    loadingMessage.textContent = data.message;
+                } else if (data.type === 'start') {
+                    progressCount.textContent = `0 / ${data.total}`;
+                } else if (data.type === 'progress') {
+                    const pct = Math.round((data.current / data.total) * 100);
+                    progressBar.style.width = `${pct}%`;
+                    progressText.textContent = `${data.code} ${data.name}`;
+                    progressCount.textContent = `${data.current} / ${data.total}`;
+                } else if (data.type === 'complete') {
+                    eventSource.close();
+
+                    if (data.status === 'success') {
+                        currentData = data.data;
+                        targetDateDisplay.textContent = data.target_date;
+                        renderTable(currentData);
+
+                        loadingStatus.classList.add('hidden');
+                        dataTable.classList.remove('hidden');
+                        lastUpdated.classList.remove('hidden');
+                        downloadCSVBtn.classList.remove('hidden');
+                        downloadCSVBtn.disabled = false;
+                    }
+
+                    fetchDataBtn.disabled = false;
+                    fetchAllToggle.disabled = false;
+                } else if (data.type === 'error') {
+                    eventSource.close();
+                    loadingStatus.classList.add('hidden');
+                    noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">エラーが発生しました: ${data.error}</p>`;
+                    noDataMessage.classList.remove('hidden');
+
+                    fetchDataBtn.disabled = false;
+                    fetchAllToggle.disabled = false;
+                }
+            };
+
+            eventSource.onerror = (error) => {
+                console.error("EventSource failed:", error);
+                // We only show error if the connection fails completely, often EventSource autoreconnects,
+                // but for our single trigger event, we will just close and show error.
+                eventSource.close();
                 loadingStatus.classList.add('hidden');
-                dataTable.classList.remove('hidden');
-                lastUpdated.classList.remove('hidden');
-                downloadCSVBtn.classList.remove('hidden');
-                downloadCSVBtn.disabled = false;
-            } else {
-                loadingStatus.classList.add('hidden');
-                noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">エラーが発生しました: ${data.error}</p>`;
+                noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">通信エラーが発生しました。サーバーが動いているか確認してください。</p>`;
                 noDataMessage.classList.remove('hidden');
-            }
+
+                fetchDataBtn.disabled = false;
+                fetchAllToggle.disabled = false;
+            };
+
         } catch (error) {
-            console.error("Fetch error:", error);
+            console.error("Setup error:", error);
             loadingStatus.classList.add('hidden');
-            noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">通信エラーが発生しました。サーバーが動いているか確認してください。</p>`;
+            noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">予期せぬエラーが発生しました。</p>`;
             noDataMessage.classList.remove('hidden');
-        } finally {
             fetchDataBtn.disabled = false;
             fetchAllToggle.disabled = false;
         }
