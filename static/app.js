@@ -13,7 +13,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentData = [];
     let currentSort = { column: null, direction: 'asc' };
 
-    fetchDataBtn.addEventListener('click', () => {
+    fetchDataBtn.addEventListener('click', async () => {
         // UI Loading state
         fetchDataBtn.disabled = true;
         downloadCSVBtn.disabled = true;
@@ -35,73 +35,216 @@ document.addEventListener('DOMContentLoaded', () => {
         progressBar.style.width = '0%';
         progressText.textContent = '準備中...';
         progressCount.textContent = '0 / 0';
-        loadingMessage.textContent = 'ETFデータを取得しています...';
+        loadingMessage.textContent = 'JPXのサイトからETF一覧を取得しています...';
 
         try {
-            const eventSource = new EventSource(`/api/fetch_etfs?limit=${limitParam}`);
+            // 1. Fetch JPX List
+            const response = await fetch('/api/fetch_etfs');
+            const data = await response.json();
 
-            eventSource.onmessage = (event) => {
-                const data = JSON.parse(event.data);
+            if (data.status === 'success') {
+                targetDateDisplay.textContent = data.target_date;
+                let etfList = data.data;
 
-                if (data.type === 'info') {
-                    loadingMessage.textContent = data.message;
-                } else if (data.type === 'start') {
-                    progressCount.textContent = `0 / ${data.total}`;
-                } else if (data.type === 'progress') {
-                    const pct = Math.round((data.current / data.total) * 100);
-                    progressBar.style.width = `${pct}%`;
-                    progressText.textContent = `${data.code} ${data.name}`;
-                    progressCount.textContent = `${data.current} / ${data.total}`;
-                } else if (data.type === 'complete') {
-                    eventSource.close();
-
-                    if (data.status === 'success') {
-                        currentData = data.data;
-                        targetDateDisplay.textContent = data.target_date;
-                        renderTable(currentData);
-
-                        loadingStatus.classList.add('hidden');
-                        dataTable.classList.remove('hidden');
-                        lastUpdated.classList.remove('hidden');
-                        downloadCSVBtn.classList.remove('hidden');
-                        downloadCSVBtn.disabled = false;
-                    }
-
-                    fetchDataBtn.disabled = false;
-                    fetchAllToggle.disabled = false;
-                } else if (data.type === 'error') {
-                    eventSource.close();
-                    loadingStatus.classList.add('hidden');
-                    noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">エラーが発生しました: ${data.error}</p>`;
-                    noDataMessage.classList.remove('hidden');
-
-                    fetchDataBtn.disabled = false;
-                    fetchAllToggle.disabled = false;
+                if (!isFetchAll && etfList.length > limitParam && limitParam !== 0) {
+                    etfList = etfList.slice(0, limitParam);
                 }
-            };
 
-            eventSource.onerror = (error) => {
-                console.error("EventSource failed:", error);
-                // We only show error if the connection fails completely, often EventSource autoreconnects,
-                // but for our single trigger event, we will just close and show error.
-                eventSource.close();
+                // Initialize currentData with empty price fields
+                currentData = etfList.map(etf => ({
+                    ...etf,
+                    price: null,
+                    change_1d_pct: null,
+                    change_1w_pct: null,
+                    change_2w_pct: null,
+                    change_1y_pct: null,
+                    dividend_yield: null,
+                    dividend_date: null
+                }));
+
+                // Render initial table without prices
+                renderTable(currentData);
+
                 loadingStatus.classList.add('hidden');
-                noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">通信エラーが発生しました。サーバーが動いているか確認してください。</p>`;
-                noDataMessage.classList.remove('hidden');
+                dataTable.classList.remove('hidden');
+                lastUpdated.classList.remove('hidden');
+                downloadCSVBtn.classList.remove('hidden');
 
+                // Show floating progress for the individual fetches
+                loadingStatus.classList.remove('hidden');
+                loadingMessage.textContent = '各ETFの株価データを取得しています...';
+
+                // 2. Fetch prices individually
+                await fetchAllPrices(currentData, progressBar, progressText, progressCount, data.target_date);
+
+                loadingStatus.classList.add('hidden');
+                downloadCSVBtn.disabled = false;
                 fetchDataBtn.disabled = false;
                 fetchAllToggle.disabled = false;
-            };
 
+            } else {
+                showError(data.error || "データ取得に失敗しました");
+            }
         } catch (error) {
-            console.error("Setup error:", error);
-            loadingStatus.classList.add('hidden');
-            noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">予期せぬエラーが発生しました。</p>`;
-            noDataMessage.classList.remove('hidden');
-            fetchDataBtn.disabled = false;
-            fetchAllToggle.disabled = false;
+            console.error("Fetch error:", error);
+            showError("JPXデータの取得に失敗しました。サーバーが動いているか確認してください。");
         }
     });
+
+    function showError(msg) {
+        loadingStatus.classList.add('hidden');
+        noDataMessage.innerHTML = `<i class="fas fa-exclamation-triangle val-negative" style="font-size: 2rem; margin-bottom: 1rem;"></i><p class="val-negative">${msg}</p>`;
+        noDataMessage.classList.remove('hidden');
+        fetchDataBtn.disabled = false;
+        fetchAllToggle.disabled = false;
+    }
+
+    // Date computation helpers
+    function getBusinessDates(targetDateStr) {
+        const targetDate = new Date(targetDateStr);
+        const daysList = [];
+        let curr = new Date(targetDate);
+
+        while (daysList.length < 300) {
+            if (curr.getDay() !== 0 && curr.getDay() !== 6) {
+                daysList.push(new Date(curr));
+            }
+            curr.setDate(curr.getDate() - 1);
+        }
+
+        return {
+            target: daysList[0],
+            prev: daysList[1],
+            week: daysList[5],
+            two_weeks: daysList[10],
+            year: daysList[daysList.length - 1]
+        };
+    }
+
+    function formatPctChange(oldPrice, newPrice) {
+        if (!oldPrice || !newPrice || oldPrice === 0) return null;
+        return ((newPrice - oldPrice) / oldPrice) * 100;
+    }
+
+    async function fetchAllPrices(etfList, progressBar, progressText, progressCount, targetDateStr) {
+        const total = etfList.length;
+        const bDates = getBusinessDates(targetDateStr);
+
+        for (let i = 0; i < total; i++) {
+            const row = etfList[i];
+
+            // Update Progress UI
+            const pct = Math.round(((i + 1) / total) * 100);
+            progressBar.style.width = `${pct}%`;
+            progressText.textContent = `${row.code} ${row.name || ''}`;
+            progressCount.textContent = `${i + 1} / ${total}`;
+
+            try {
+                // Add tiny client-side delay to spread requests
+                await new Promise(r => setTimeout(r, 200));
+
+                const res = await fetch(`/api/proxy/yfinance/${row.clean_code}.T`);
+                const json = await res.json();
+
+                if (json.status === 'success' && json.data) {
+                    const hist = json.data;
+
+                    const getPriceForDate = (targetD) => {
+                        let d = new Date(targetD);
+                        for (let attempts = 0; attempts < 10; attempts++) {
+                            const dStr = d.toISOString().split('T')[0];
+                            if (hist[dStr]) return hist[dStr].Close;
+                            d.setDate(d.getDate() - 1); // Walk backwards
+                        }
+                        return null;
+                    };
+
+                    const currentPrice = getPriceForDate(bDates.target);
+                    const prevPrice = getPriceForDate(bDates.prev);
+                    const weekPrice = getPriceForDate(bDates.week);
+                    const twoWeekPrice = getPriceForDate(bDates.two_weeks);
+                    const yearPrice = getPriceForDate(bDates.year);
+
+                    row.price = currentPrice ? Math.round(currentPrice * 100) / 100 : null;
+                    row.change_1d_pct = formatPctChange(prevPrice, currentPrice);
+                    row.change_1w_pct = formatPctChange(weekPrice, currentPrice);
+                    row.change_2w_pct = formatPctChange(twoWeekPrice, currentPrice);
+                    row.change_1y_pct = formatPctChange(yearPrice, currentPrice);
+
+                    row.dividend_yield = "-";
+                    row.dividend_date = "-";
+
+                    let annualDiv = 0;
+                    const oneYearAgoTime = new Date().getTime() - (365 * 24 * 60 * 60 * 1000);
+                    let hasDivs = false;
+                    const divDates = [];
+
+                    Object.keys(hist).forEach(dStr => {
+                        const dTime = new Date(dStr).getTime();
+                        if (hist[dStr].Dividends > 0) {
+                            hasDivs = true;
+                            divDates.push(new Date(dStr));
+                            if (dTime > oneYearAgoTime) {
+                                annualDiv += hist[dStr].Dividends;
+                            }
+                        }
+                    });
+
+                    if (hasDivs && currentPrice && currentPrice > 0 && annualDiv > 0) {
+                        const calcYield = (annualDiv / currentPrice) * 100;
+                        row.dividend_yield = `${calcYield.toFixed(2)}%`;
+                    }
+
+                    if (hasDivs && divDates.length > 0) {
+                        divDates.sort((a, b) => a - b);
+                        const recentDivs = divDates.slice(-24);
+                        const today = new Date();
+
+                        const payoutMonths = [...new Set(recentDivs.map(d => d.getMonth() + 1))].sort((a, b) => a - b);
+                        const avgDayByMonth = {};
+                        payoutMonths.forEach(m => {
+                            const days = recentDivs.filter(d => (d.getMonth() + 1) === m).map(d => d.getDate());
+                            avgDayByMonth[m] = days.length > 0 ? Math.round(days.reduce((sum, d) => sum + d, 0) / days.length) : 10;
+                        });
+
+                        let nextMonth = null;
+                        let nextYear = today.getFullYear();
+                        let nextDay = null;
+
+                        const currentMonth = today.getMonth() + 1;
+                        const currentDay = today.getDate();
+
+                        for (let j = 0; j < payoutMonths.length; j++) {
+                            const m = payoutMonths[j];
+                            if (m === currentMonth && currentDay < avgDayByMonth[m]) {
+                                nextMonth = m;
+                                nextDay = avgDayByMonth[m];
+                                break;
+                            } else if (m > currentMonth) {
+                                nextMonth = m;
+                                nextDay = avgDayByMonth[m];
+                                break;
+                            }
+                        }
+
+                        if (!nextMonth && payoutMonths.length > 0) {
+                            nextMonth = payoutMonths[0];
+                            nextYear += 1;
+                            nextDay = avgDayByMonth[nextMonth];
+                        }
+
+                        if (nextMonth && nextDay) {
+                            row.dividend_date = `次回予想: ${nextYear}年${nextMonth}月${nextDay}日頃`;
+                        }
+                    }
+
+                    renderTable(currentData);
+                }
+            } catch (err) {
+                console.error(`Error fetching price for ${row.code}:`, err);
+            }
+        }
+    }
 
     // Formatting helpers
     const formatNumber = (num, noDecimals = false) => {
