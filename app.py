@@ -156,12 +156,7 @@ async def fetch_etfs(limit: int = 20):
                 
                 ticker_symbol = f"{code_match}.T"
                 
-                # Use a custom session with a common User-Agent to bypass basic blocks
-                session = requests.Session()
-                session.headers.update({
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                })
-                ticker = yf.Ticker(ticker_symbol, session=session)
+                ticker = yf.Ticker(ticker_symbol)
                 
                 # Fetch historical history
                 hist = ticker.history(start=df_date_str(start_fetch_date), end=df_date_str(end_fetch_date))
