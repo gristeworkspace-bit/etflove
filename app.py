@@ -9,13 +9,12 @@ import pandas as pd
 import jpholiday
 from datetime import datetime, timedelta
 import pytz
+import logging
 import math
 import time
 import json
 import asyncio
 import requests_cache
-import json
-import asyncio
 
 app = fastapi.FastAPI(title="ETF Viewer")
 
@@ -87,8 +86,9 @@ async def fetch_etfs(limit: int = 20):
     Scrapes JPX ETF page, then fetches Yahoo Finance data for each.
     Streams progress to the client via Server-Sent Events (SSE).
     """
+    logger = logging.getLogger("uvicorn.error")
+    
     async def event_generator():
-        logger = logging.getLogger("uvicorn.error")
         
         yield f"data: {json.dumps({'type': 'info', 'message': 'JPXのサイトからETF一覧を取得しています...'})}\n\n"
         
