@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import pytz
 import logging
 import math
+import time
 
 app = fastapi.FastAPI(title="ETF Viewer")
 
@@ -150,8 +151,17 @@ async def fetch_etfs(limit: int = 20):
         
         if code_match:
             try:
+                # Add a small delay to avoid hitting the rate limit too quickly
+                time.sleep(0.5)
+                
                 ticker_symbol = f"{code_match}.T"
-                ticker = yf.Ticker(ticker_symbol)
+                
+                # Use a custom session with a common User-Agent to bypass basic blocks
+                session = requests.Session()
+                session.headers.update({
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                })
+                ticker = yf.Ticker(ticker_symbol, session=session)
                 
                 # Fetch historical history
                 hist = ticker.history(start=df_date_str(start_fetch_date), end=df_date_str(end_fetch_date))
