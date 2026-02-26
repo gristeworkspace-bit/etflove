@@ -112,7 +112,8 @@ async def fetch_etfs(limit: int = 20):
     def df_date_str(d):
         return d.strftime('%Y-%m-%d')
         
-    start_fetch_date = dates['year'] - timedelta(days=5) # fetch a bit earlier to ensure enough data
+    # Fetch 2.5 years earlier to ensure enough data for dividends pattern prediction
+    start_fetch_date = dates['year'] - timedelta(days=550)
     end_fetch_date = dates['target'] + timedelta(days=1)   # exclusive upper bound
     
     count = 0
@@ -177,28 +178,23 @@ async def fetch_etfs(limit: int = 20):
                     etf_data["change_2w_pct"] = format_pct_change(two_week_price, current_price)
                     etf_data["change_1y_pct"] = format_pct_change(year_price, current_price)
                 
-                # Fetch Dividends. Using fast-info or info
-                info = ticker.info
-                # Yield
-                div_yield = info.get('dividendYield') or info.get('trailingAnnualDividendYield')
-                if div_yield is not None:
-                    try:
-                        div_val = float(div_yield)
-                        etf_data["dividend_yield"] = f"{div_val:.2f}%"
-                    except (ValueError, TypeError):
-                        etf_data["dividend_yield"] = "-"
-                else:
-                    etf_data["dividend_yield"] = "-"
-                    
-                # Date (DividendDate usually comes as timestamp for US stocks, mostly None for JP)
-                # Next Dividend Date Prediction for Japanese ETFs
+                # Calculate Dividend Yield and predict Next Dividend Date from history
                 etf_data["dividend_date"] = "-"
+                etf_data["dividend_yield"] = "-"
                 
-                # We can estimate the next dividend based on historical 'actions'
-                actions = ticker.actions
-                if not actions.empty and 'Dividends' in actions.columns:
-                    divs = actions[actions['Dividends'] > 0]
+                if 'Dividends' in hist.columns:
+                    divs = hist[hist['Dividends'] > 0]
                     if not divs.empty:
+                        # 1. Calculate yield based on trailing 12 months
+                        last_year_date = hist.index[-1] - timedelta(days=365)
+                        trailing_divs = divs[divs.index > last_year_date]
+                        annual_div = trailing_divs['Dividends'].sum()
+                        
+                        if current_price and current_price > 0 and annual_div > 0:
+                            calc_yield = (annual_div / current_price) * 100
+                            etf_data["dividend_yield"] = f"{calc_yield:.2f}%"
+                        
+                        # 2. Predict next dividend date
                         # Get the last 2 years of dividends to find the pattern
                         recent_divs = divs.tail(24)
                         
@@ -230,11 +226,13 @@ async def fetch_etfs(limit: int = 20):
                                 
                         if not next_month:
                             # Roll over to next year's first payout
-                            next_month = payout_months[0]
-                            next_year += 1
-                            next_day = avg_day_by_month[next_month]
-                            
-                        etf_data["dividend_date"] = f"次回予想: {next_year}年{next_month}月{next_day}日頃"
+                            if len(payout_months) > 0:
+                                next_month = payout_months[0]
+                                next_year += 1
+                                next_day = avg_day_by_month[next_month]
+                                
+                        if next_month and next_day:
+                            etf_data["dividend_date"] = f"次回予想: {next_year}年{next_month}月{next_day}日頃"
                         
             except Exception as e:
                 logger.error(f"Error fetching data for {code_match}: {e}")
