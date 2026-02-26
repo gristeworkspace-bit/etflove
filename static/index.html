@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ETF Data Viewer (JPX + Yahoo Finance)</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap"
+        rel="stylesheet">
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <header class="glass-header">
+            <div class="header-content">
+                <h1>
+                    <i class="fas fa-chart-line gradient-text icon-margin"></i>
+                    <span class="gradient-text">ETF Data Viewer</span>
+                </h1>
+                <p class="subtitle">JPX上場ETF情報 & Yahoo Finance終値データ</p>
+                <div class="controls">
+                    <button id="fetchDataBtn" class="primary-btn">
+                        <i class="fas fa-cloud-download-alt icon-margin"></i> データの取得を開始
+                    </button>
+                    <button id="downloadCSVBtn" class="secondary-btn hidden">
+                        <i class="fas fa-file-csv icon-margin"></i> CSVダウンロード
+                    </button>
+                    <!-- Toggle switch for Fetch Limit -->
+                    <div class="toggle-container" title="オンにすると全銘柄取得します。時間がかかります。">
+                        <label class="switch">
+                            <input type="checkbox" id="fetchAllToggle">
+                            <span class="slider round"></span>
+                        </label>
+                        <span class="toggle-label">全件取得 (処理時間注意)</span>
+                    </div>
+                </div>
+            </div>
+
+            <div id="loadingStatus" class="loading-status hidden">
+                <div class="spinner"></div>
+                <p>JPXスクレイピング中 & Yahoo Finance APIデータ取得中...<br><span class="small-text">(全件取得には1〜2分かかる場合があります)</span>
+                </p>
+            </div>
+
+            <div id="lastUpdated" class="last-updated hidden">
+                <span><i class="far fa-clock"></i> 基準日 (終値): <strong id="targetDateDisplay">---</strong></span>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <div class="table-container glass-panel">
+                <table id="dataTable" class="hidden">
+                    <thead>
+                        <tr>
+                            <th data-sort="code" class="sortable">コード <i class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="name" class="sortable">名称 <i class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="benchmark" class="sortable">連動対象指標 <i class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="management" class="sortable">管理会社名 <i class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="fee" class="sortable">信託報酬 <i class="fas fa-sort sort-icon"></i></th>
+
+                            <th data-sort="price" class="sortable align-right highlight-col">終値(円) <i
+                                    class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="change_1d_pct" class="sortable align-right">前日比 <i
+                                    class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="change_1w_pct" class="sortable align-right">1週比 <i
+                                    class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="change_2w_pct" class="sortable align-right">2週比 <i
+                                    class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="change_1y_pct" class="sortable align-right">1年比 <i
+                                    class="fas fa-sort sort-icon"></i></th>
+
+                            <th data-sort="dividend_yield" class="sortable align-right highlight-col-alt">配当利回り <i
+                                    class="fas fa-sort sort-icon"></i></th>
+                            <th data-sort="dividend_date" class="sortable align-center">直近配当日 <i
+                                    class="fas fa-sort sort-icon"></i></th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody">
+                        <!-- Data will be injected here -->
+                    </tbody>
+                </table>
+                <div id="noDataMessage" class="no-data-msg">
+                    <i class="fas fa-search info-icon"></i>
+                    <p>上のボタンをクリックしてデータを取得してください</p>
+                </div>
+            </div>
+        </main>
+
+        <footer class="glass-footer">
+            <p>© 2026 ETF Data Viewer. Data provided by JPX and Yahoo Finance.</p>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
