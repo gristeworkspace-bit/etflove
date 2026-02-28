@@ -64,16 +64,20 @@ def send_line_message(message: str):
 
 # ===== ② Gemini AI分析 =====
 def get_ai_analysis(market_context: str) -> str:
-    """Gemini APIを使って相場状況を分析させる"""
+    """豊富な相場データを基にGemini APIで分析させる"""
     if not ai_client:
         return ""
 
     prompt = f"""
 あなたは優秀なFX（ドル円）の専属アナリストです。
-以下の現在の相場状況に基づいて、トレーダーに向けて【端的で客観的な一言アドバイス】を書いてください。
-文字数は100文字以内で、冗長な挨拶は不要です。
+以下の詳細な相場データに基づいて、トレーダーに向けて【具体的で実践的なアドバイス】を書いてください。
 
-【現在の相場状況】
+ルール:
+- 「情報が不足」という回答は禁止。提供されたデータだけで判断すること。
+- 「売り・買い・様子見」のいずれかの方向性を必ず示すこと。
+- 注目すべき価格ラインや打診ポイントを具体的に示すこと。
+- 文字数は150文字以内。冗長な挨拶は不要。
+
 {market_context}
 """
     try:
@@ -301,6 +305,7 @@ def build_alert_message(zone: dict, current_price: float, alert_type: str) -> tu
         f"{zone_price:.2f}円付近の{label}に接近中。"
         f"過去{zone['reaction_count']}回反発しており、壁の強さは{zone['strength_str']}。"
         f"壁までの距離は{diff_pips:.0f}pips。"
+        f"平均ヒゲ比率{zone['avg_wick_ratio']:.1f}（高いほど拒否が強い）。"
     )
 
     return msg, ai_context
@@ -327,6 +332,63 @@ def build_range_message(res_zone: dict, sup_zone: dict, current_price: float) ->
     )
 
     return msg, ai_context
+
+
+# ===== ⑥-B: AIに渡す豊富な相場コンテキストの構築 =====
+def build_full_ai_context(df: pd.DataFrame, current_price: float, zones: list, alert_context: str) -> str:
+    """
+    AIに渡すための包括的な相場データを構築する。
+    - 直近の値動きサマリー（高値・安値・方向感）
+    - 検出された全ゾーン（壁）の一覧
+    - 今回のアラート内容
+    """
+    context = "【アラート内容】\n"
+    context += alert_context + "\n\n"
+
+    # --- 直近の値動きサマリー ---
+    context += "【直近の値動き】\n"
+
+    if not df.empty and len(df) >= 2:
+        # 直近24時間（15分足×96本）の値動き
+        recent = df.tail(96) if len(df) >= 96 else df
+        recent_high = float(recent['High'].max())
+        recent_low = float(recent['Low'].min())
+        recent_open = float(recent['Open'].iloc[0])
+        recent_close = float(recent['Close'].iloc[-1])
+        change = recent_close - recent_open
+        direction = "上昇" if change > 0 else "下落" if change < 0 else "横ばい"
+
+        context += f"直近24時間: 高値{recent_high:.2f}円 / 安値{recent_low:.2f}円 / 値幅{(recent_high - recent_low)*100:.0f}pips\n"
+        context += f"方向: {direction}（{change:+.2f}円 / {change*100:+.0f}pips）\n"
+
+        # 直近4時間（15分足×16本）のトレンド
+        very_recent = df.tail(16) if len(df) >= 16 else df
+        vr_open = float(very_recent['Open'].iloc[0])
+        vr_close = float(very_recent['Close'].iloc[-1])
+        vr_change = vr_close - vr_open
+        vr_dir = "上昇中" if vr_change > 0.02 else "下落中" if vr_change < -0.02 else "もみ合い"
+        context += f"直近4時間の勢い: {vr_dir}（{vr_change:+.2f}円）\n"
+
+    context += f"現在価格: {current_price:.2f}円\n\n"
+
+    # --- 全ゾーン一覧（壁の地図） ---
+    context += "【検出された壁（価格帯）の一覧】\n"
+    res_zones = sorted([z for z in zones if z["type"] == "resistance"], key=lambda z: z["zone_price"])
+    sup_zones = sorted([z for z in zones if z["type"] == "support"], key=lambda z: z["zone_price"], reverse=True)
+
+    if res_zones:
+        context += "▲ レジスタンス（上値の壁）:\n"
+        for z in res_zones[:5]:  # 上位5つ
+            dist = (z["zone_price"] - current_price) * 100
+            context += f"  {z['zone_price']:.2f}円 {z['strength_str']} 反応{z['reaction_count']}回 (現在価格から{dist:+.0f}pips)\n"
+
+    if sup_zones:
+        context += "▼ サポート（下値の壁）:\n"
+        for z in sup_zones[:5]:  # 上位5つ
+            dist = (z["zone_price"] - current_price) * 100
+            context += f"  {z['zone_price']:.2f}円 {z['strength_str']} 反応{z['reaction_count']}回 (現在価格から{dist:+.0f}pips)\n"
+
+    return context
 
 
 # ===== ⑦ メインの分析タスク =====
@@ -361,8 +423,8 @@ def run_analysis_task(force: bool = False):
 
             test_msg = f"📊【🔧テスト通知】（{datetime.now().strftime('%Y/%m/%d %H:%M')}）\n\n"
             test_msg += f"現在価格: {current_price:.2f}円\n"
-            test_msg += f"検出されたスイングポイント: {len(swing_points)}個\n"
-            test_msg += f"統合後のゾーン: {len(zones)}個\n\n"
+            test_msg += f"検出された反発ポイント: {len(swing_points)}個\n"
+            test_msg += f"意識される価格帯: {len(zones)}個\n\n"
 
             if res_zones:
                 nearest_res = min(res_zones, key=lambda z: abs(z["zone_price"] - current_price))
@@ -431,7 +493,9 @@ def run_analysis_task(force: bool = False):
         # Step 5: メッセージ送信
         if message:
             if ai_context:
-                message += get_ai_analysis(ai_context)
+                # AIに相場全体の地図も渡す
+                full_ai_context = build_full_ai_context(df, current_price, zones, ai_context)
+                message += get_ai_analysis(full_ai_context)
 
             send_line_message(message)
             print("通知を送信しました:\n" + message)
