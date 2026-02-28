@@ -395,6 +395,13 @@ def build_full_ai_context(df: pd.DataFrame, current_price: float, zones: list, a
 def run_analysis_task(force: bool = False):
     print(f"[{datetime.now()}] 価格チェックを開始します... (force={force})")
 
+    # 土日は通知をスキップ（FXは土日休場のため）
+    # force=True の場合はテスト用にスキップしない
+    now = datetime.now()
+    if not force and now.weekday() in (5, 6):  # 5=Saturday, 6=Sunday
+        print(f"本日は{'土曜日' if now.weekday() == 5 else '日曜日'}のため、通知をスキップします。")
+        return
+
     try:
         ticker = yf.Ticker('JPY=X')
 
