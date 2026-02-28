@@ -77,7 +77,7 @@ def get_ai_analysis(market_context: str) -> str:
             model='gemini-2.5-flash',
             contents=prompt,
         )
-        return f"\\n\\n🤖AIアナリストのひとこと:\\n{response.text.strip()}"
+        return f"\n\n🤖AIアナリストのひとこと:\n{response.text.strip()}"
     except Exception as e:
         print(f"Gemini APIエラー: {e}")
         return ""
@@ -184,22 +184,22 @@ def run_analysis_task(force: bool = False):
         # --- レンジ判定 ---
         in_range, range_top, range_bottom = is_in_range(df_very_short, RANGE_THRESHOLD)
         if in_range and can_notify("range", current_price):
-            message += f"\\n【📉レンジ相場】直近12時間は狭いレンジ（もみ合い）になっています！\\n上限: {range_top:.2f}円\\n下限: {range_bottom:.2f}円\\n現在価格: {current_price:.2f}円\\n※ブレイクアウトにご注意ください。"
+            message += f"\n【📉レンジ相場】直近12時間は狭いレンジ（もみ合い）になっています！\n上限: {range_top:.2f}円\n下限: {range_bottom:.2f}円\n現在価格: {current_price:.2f}円\n※ブレイクアウトにご注意ください。"
             ai_context = f"過去12時間は {range_bottom:.2f}円から{range_top:.2f}円のレンジ相場。現在価格は{current_price:.2f}円。"
             update_notify_state("range", current_price)
 
         # --- 長期の強い壁を優先的に判定 ---
         closest_long_top = check_proximity(current_price, long_tops, THRESHOLD)
         if closest_long_top and can_notify("long_top", current_price):
-            base_msg = f"\\n【🔥激アツ】過去14日間の強い天井（レジスタンス帯）に接近中！\\n壁の価格: {closest_long_top:.2f}円\\n現在価格: {current_price:.2f}円"
-            message += base_msg + "\\n※反発下落の可能性が高まっています。"
+            base_msg = f"\n【🔥激アツ】過去14日間の強い天井（レジスタンス帯）に接近中！\n壁の価格: {closest_long_top:.2f}円\n現在価格: {current_price:.2f}円"
+            message += base_msg + "\n※反発下落の可能性が高まっています。"
             ai_context = f"現在価格{current_price:.2f}円。過去14日間の強力なレジスタンス({closest_long_top:.2f}円)に接近中。"
             update_notify_state("long_top", current_price)
 
         closest_long_bottom = check_proximity(current_price, long_bottoms, THRESHOLD)
         if closest_long_bottom and can_notify("long_bottom", current_price):
-            base_msg = f"\\n【🔥激アツ】過去14日間の強い底（サポート帯）に接近中！\\n壁の価格: {closest_long_bottom:.2f}円\\n現在価格: {current_price:.2f}円"
-            message += base_msg + "\\n※反発上昇の可能性が高まっています。"
+            base_msg = f"\n【🔥激アツ】過去14日間の強い底（サポート帯）に接近中！\n壁の価格: {closest_long_bottom:.2f}円\n現在価格: {current_price:.2f}円"
+            message += base_msg + "\n※反発上昇の可能性が高まっています。"
             ai_context = f"現在価格{current_price:.2f}円。過去14日間の強力なサポート({closest_long_bottom:.2f}円)に接近中。"
             update_notify_state("long_bottom", current_price)
             
@@ -207,13 +207,13 @@ def run_analysis_task(force: bool = False):
         if not message and not in_range:
             closest_short_top = check_proximity(current_price, short_tops, THRESHOLD)
             if closest_short_top and can_notify("short_top", current_price):
-                message += f"\\n【⚠️注意】過去2日間の直近の天井に接近中！\\n壁の価格: {closest_short_top:.2f}円\\n現在価格: {current_price:.2f}円"
+                message += f"\n【⚠️注意】過去2日間の直近の天井に接近中！\n壁の価格: {closest_short_top:.2f}円\n現在価格: {current_price:.2f}円"
                 ai_context = f"現在価格{current_price:.2f}円。直近2日間のレジスタンス({closest_short_top:.2f}円)に接近中。"
                 update_notify_state("short_top", current_price)
 
             closest_short_bottom = check_proximity(current_price, short_bottoms, THRESHOLD)
             if closest_short_bottom and can_notify("short_bottom", current_price):
-                message += f"\\n【⚠️注意】過去2日間の直近の底に接近中！\\n壁の価格: {closest_short_bottom:.2f}円\\n現在価格: {current_price:.2f}円"
+                message += f"\n【⚠️注意】過去2日間の直近の底に接近中！\n壁の価格: {closest_short_bottom:.2f}円\n現在価格: {current_price:.2f}円"
                 ai_context = f"現在価格{current_price:.2f}円。直近2日間のサポート({closest_short_bottom:.2f}円)に接近中。"
                 update_notify_state("short_bottom", current_price)
 
