@@ -496,8 +496,14 @@ def run_analysis_task(force: bool = False):
                 nearest_sup = min(sup_zones, key=lambda z: abs(z["zone_price"] - current_price))
                 test_msg += f"最寄りのサポート: {nearest_sup['zone_price']:.2f}円 {nearest_sup['strength_str']}\n"
 
-            test_context = f"現在価格は{current_price:.2f}円です。テスト送信です。"
-            test_msg += get_ai_analysis(test_context)
+            test_alert_context = f"現在価格{current_price:.2f}円。テスト送信。"
+            if res_zones:
+                test_alert_context += f"最寄りレジスタンス: {nearest_res['zone_price']:.2f}円 {nearest_res['strength_str']}。"
+            if sup_zones:
+                test_alert_context += f"最寄りサポート: {nearest_sup['zone_price']:.2f}円 {nearest_sup['strength_str']}。"
+
+            full_context = build_full_ai_context(df, current_price, zones, test_alert_context)
+            test_msg += get_ai_analysis(full_context)
             send_line_message(test_msg)
             print("強制テスト通知を送信しました。")
             return
