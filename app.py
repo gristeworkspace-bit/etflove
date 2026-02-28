@@ -14,7 +14,11 @@ import json
 import asyncio
 import requests_cache
 
+from fx_bot import router as fx_router
+
 app = fastapi.FastAPI(title="ETF Viewer")
+
+app.include_router(fx_router)
 
 # Serve the frontend files
 app.mount("/static", StaticFiles(directory="static"), name="static")
