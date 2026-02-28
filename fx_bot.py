@@ -131,8 +131,8 @@ def is_in_range(df: pd.DataFrame, max_range_pips: float):
         return True, max_price, min_price
     return False, max_price, min_price
 
-def run_analysis_task():
-    print(f"[{datetime.now()}] 価格チェックを開始します...")
+def run_analysis_task(force: bool = False):
+    print(f"[{datetime.now()}] 価格チェックを開始します... (force={force})")
     
     try:
         ticker = yf.Ticker('JPY=X')
@@ -166,6 +166,15 @@ def run_analysis_task():
         message = ""
         ai_context = ""
         
+        # --- 強制テスト通知 ---
+        if force:
+            test_msg = f"\\n【🔧テスト通知】Renderからの手動トリガー成功！\\n現在価格: {current_price:.2f}円\\n※相場状況にかかわらず強制送信しました。"
+            test_context = f"現在価格は{current_price:.2f}円です。これはシステムのテスト送信です。"
+            test_msg += get_ai_analysis(test_context)
+            send_line_message(test_msg)
+            print("強制テスト通知を送信しました。")
+            return
+
         # --- レンジ判定 ---
         in_range, range_top, range_bottom = is_in_range(df_very_short, RANGE_THRESHOLD)
         if in_range and can_notify("range", current_price):
@@ -220,10 +229,11 @@ def read_root():
     return {"status": "ok", "message": "FX Bottom/Top Bot is running."}
 
 @router.get("/trigger")
-def trigger_analysis(background_tasks: BackgroundTasks):
+def trigger_analysis(background_tasks: BackgroundTasks, force: bool = False):
     """
     cron-job.org 等からこのエンドポイントを定期的に叩くことで、
     Renderのスリープを防ぎつつバックグラウンドで価格判定と通知を行います。
+    ?force=true をつけると条件無視で強制通知テストができます。
     """
-    background_tasks.add_task(run_analysis_task)
-    return {"status": "Analysis triggered in background"}
+    background_tasks.add_task(run_analysis_task, force)
+    return {"status": "Analysis triggered in background", "force": force}
