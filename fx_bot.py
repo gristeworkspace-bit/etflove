@@ -7,6 +7,8 @@ import pandas as pd
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, BroadcastRequest, TextMessage
 
 from google import genai
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 router = APIRouter()
 
@@ -34,13 +36,19 @@ last_notified = {
     "resistance": {"time": None, "price": 0.0},
     "support": {"time": None, "price": 0.0},
     "range": {"time": None, "price": 0.0},
+    "breakout_up": {"time": None, "price": 0.0},
+    "breakout_down": {"time": None, "price": 0.0},
 }
 
 # ===== 設定パラメータ =====
 COOLDOWN_HOURS = 1       # 同じ種類の通知を再送するまでの待機時間
 THRESHOLD = 0.10         # 現在価格と壁ゾーンの間のしきい値 (0.1円 = 10pips)
 ZONE_MERGE_PIPS = 0.05   # 壁をグループ化する際の許容幅 (5pips以内は同一ゾーンとみなす)
+BREAKOUT_MARGIN = 0.05   # 壁をこの値（5pips）以上超えたらブレイクアウト確定とみなす
 SWING_WINDOW = 5         # スイングポイント検出の左右の確認本数
+
+# バックグラウンドスケジューラー
+_scheduler = None
 
 
 # ===== ① LINE送信 =====
@@ -334,6 +342,54 @@ def build_range_message(res_zone: dict, sup_zone: dict, current_price: float) ->
     return msg, ai_context
 
 
+# ===== ⑥-A2: ブレイクアウトメッセージ生成 =====
+def build_breakout_message(zone: dict, current_price: float, direction: str) -> tuple:
+    """
+    壁を突き抜けた場合のブレイクアウト通知メッセージを生成する。
+    direction: "up"（上方ブレイク）or "down"（下方ブレイク）
+    """
+    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    zone_price = zone["zone_price"]
+    diff_pips = abs(current_price - zone_price) * 100
+
+    if direction == "up":
+        emoji = "🚀"
+        label = "上方ブレイクアウト"
+        wall_label = "天井（レジスタンス）"
+        action = "上昇トレンド加速の可能性があります"
+    else:
+        emoji = "💥"
+        label = "下方ブレイクアウト"
+        wall_label = "底（サポート）"
+        action = "下落トレンド加速の可能性があります"
+
+    msg = f"📊 ドル円アラート（{now_str}）\n\n"
+    msg += f"【{emoji}{label}】{zone_price:.2f}円の{wall_label}を突破！\n"
+    msg += f"　突破した壁の強さ: {zone['strength_str']}（過去{zone['reaction_count']}回反発していた壁）\n"
+    msg += f"　現在価格: {current_price:.2f}円（壁から{diff_pips:.0f}pips突破）\n"
+    msg += f"\n【根拠】\n"
+
+    # 過去の反応履歴（最大3件）
+    for reaction in zone["reactions"][:3]:
+        ts = reaction["timestamp"]
+        if hasattr(ts, 'strftime'):
+            ts_str = ts.strftime("%m/%d %H:%M")
+        else:
+            ts_str = str(ts)[:16]
+        msg += f"・{ts_str} に{zone_price:.2f}円付近で反発していた\n"
+
+    msg += f"\n※{action}"
+
+    ai_context = (
+        f"現在価格{current_price:.2f}円。"
+        f"{zone_price:.2f}円の{wall_label}（{zone['strength_str']}、過去{zone['reaction_count']}回反発）を"
+        f"{diff_pips:.0f}pips突破した{label}が発生。"
+        f"トレンドの継続か、ダマシで戻るかの判断が重要。"
+    )
+
+    return msg, ai_context
+
+
 # ===== ⑥-B: AIに渡す豊富な相場コンテキストの構築 =====
 def build_full_ai_context(df: pd.DataFrame, current_price: float, zones: list, alert_context: str) -> str:
     """
@@ -479,7 +535,33 @@ def run_analysis_task(force: bool = False):
         ai_context = ""
 
         # Step 4: アラート判定
-        if nearby_res and nearby_sup:
+
+        # --- 4a: ブレイクアウト判定 ---
+        # 全てのレジスタンスゾーンを上に突き抜けているかチェック
+        all_res = [z for z in zones if z["type"] == "resistance"]
+        all_sup = [z for z in zones if z["type"] == "support"]
+
+        # 上方ブレイクアウト: 現在価格がレジスタンスゾーンを BREAKOUT_MARGIN 以上超えている
+        broken_res = [z for z in all_res if current_price > z["zone_price"] + BREAKOUT_MARGIN]
+        # 下方ブレイクアウト: 現在価格がサポートゾーンを BREAKOUT_MARGIN 以上下回っている
+        broken_sup = [z for z in all_sup if current_price < z["zone_price"] - BREAKOUT_MARGIN]
+
+        if broken_res:
+            # 最も高い（=最も重要な）突破されたレジスタンスを選択
+            strongest_broken = max(broken_res, key=lambda z: z["zone_price"])
+            if can_notify("breakout_up", current_price):
+                message, ai_context = build_breakout_message(strongest_broken, current_price, "up")
+                update_notify_state("breakout_up", current_price)
+
+        elif broken_sup:
+            # 最も低い（=最も重要な）突破されたサポートを選択
+            strongest_broken = min(broken_sup, key=lambda z: z["zone_price"])
+            if can_notify("breakout_down", current_price):
+                message, ai_context = build_breakout_message(strongest_broken, current_price, "down")
+                update_notify_state("breakout_down", current_price)
+
+        # --- 4b: 壁への接近判定（従来ロジック） ---
+        elif nearby_res and nearby_sup:
             # 天井にも底にも挟まれている = レンジ（膠着）
             if can_notify("range", current_price):
                 message, ai_context = build_range_message(nearby_res[0], nearby_sup[0], current_price)
@@ -513,15 +595,47 @@ def run_analysis_task(force: bool = False):
         print(f"エラーが発生しました: {e}")
 
 
+# ===== ⑧ バックグラウンドスケジューラー =====
+def start_scheduler():
+    """平日のみ1分間隔で価格チェックを自動実行するスケジューラーを起動する"""
+    global _scheduler
+    if _scheduler is not None:
+        print("[SCHEDULER] スケジューラーは既に起動しています。")
+        return
+
+    _scheduler = BackgroundScheduler(daemon=True)
+    # 月〜金の毎分0秒に実行
+    _scheduler.add_job(
+        run_analysis_task,
+        CronTrigger(day_of_week='mon-fri', minute='*', second='0'),
+        id='fx_analysis',
+        name='FX価格分析（1分間隔）',
+        replace_existing=True,
+        misfire_grace_time=30,  # 30秒以内の遅延は許容
+    )
+    _scheduler.start()
+    print("[SCHEDULER] FX分析スケジューラーを起動しました（平日1分間隔）")
+
+
+def stop_scheduler():
+    """スケジューラーを停止する"""
+    global _scheduler
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
+        _scheduler = None
+        print("[SCHEDULER] FX分析スケジューラーを停止しました")
+
+
 @router.get("/fx_health")
 def read_root():
-    return {"status": "ok", "message": "FX Bottom/Top Bot is running."}
+    return {"status": "ok", "message": "FX Bottom/Top Bot is running.", "scheduler": _scheduler is not None}
 
 @router.get("/trigger")
 def trigger_analysis(background_tasks: BackgroundTasks, force: bool = False):
     """
-    cron-job.org 等からこのエンドポイントを定期的に叩くことで、
-    Renderのスリープを防ぎつつバックグラウンドで価格判定と通知を行います。
+    手動テストや強制通知用エンドポイント。
+    スケジューラーが平日1分間隔で自動実行するため、通常はcronからの呼び出し不要。
+    cron-job.org はRenderのスリープ防止（死活監視）用として使用。
     ?force=true をつけると条件無視で強制通知テストができます。
     """
     background_tasks.add_task(run_analysis_task, force)

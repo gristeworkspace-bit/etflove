@@ -9,3 +9,4 @@ gunicorn
 requests-cache
 google-genai
 line-bot-sdk
+apscheduler

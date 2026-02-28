@@ -13,10 +13,19 @@ import logging
 import json
 import asyncio
 import requests_cache
+from contextlib import asynccontextmanager
 
-from fx_bot import router as fx_router
+from fx_bot import router as fx_router, start_scheduler, stop_scheduler
 
-app = fastapi.FastAPI(title="ETF Viewer")
+
+@asynccontextmanager
+async def lifespan(app):
+    """起動時にFXスケジューラーを開始し、終了時に停止する"""
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+app = fastapi.FastAPI(title="ETF Viewer", lifespan=lifespan)
 
 app.include_router(fx_router)
 
