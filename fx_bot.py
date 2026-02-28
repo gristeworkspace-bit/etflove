@@ -17,9 +17,12 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # LINE Messaging API クライアントの初期化
 line_client = None
 if LINE_CHANNEL_ACCESS_TOKEN:
+    print(f"[INIT] LINE_CHANNEL_ACCESS_TOKEN is set (length: {len(LINE_CHANNEL_ACCESS_TOKEN)}). Initializing line_client...")
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
     api_client = ApiClient(configuration)
     line_client = MessagingApi(api_client)
+else:
+    print("[INIT] WARNING: LINE_CHANNEL_ACCESS_TOKEN is NOT set.")
 
 # Geminiクライアントの初期化 (APIキーがあれば)
 ai_client = None
@@ -48,10 +51,13 @@ def send_line_message(message: str):
         broadcast_request = BroadcastRequest(
             messages=[TextMessage(text=message)]
         )
-        line_client.broadcast(broadcast_request)
-        print("LINE Messaging API (Broadcast) 経由で通知を送信しました。")
+        print("Sending BroadcastRequest to LINE API...")
+        response = line_client.broadcast(broadcast_request)
+        print(f"LINE Messaging API (Broadcast) response: {response}")
     except Exception as e:
-        print(f"LINE Messaging API 送信エラー: {e}")
+        print(f"LINE Messaging API 送信エラー: {type(e).__name__} - {e}")
+        if hasattr(e, 'body'):
+            print(f"Error Details: {e.body}")
 
 def get_ai_analysis(market_context: str) -> str:
     """Gemini APIを使って相場状況を分析させる"""
