@@ -31,22 +31,24 @@ if GEMINI_API_KEY:
 
 # スパム通知防止用の状態保持変数 (オンメモリ)
 last_notified = {
-    "long_top": {"time": None, "price": 0.0},
-    "long_bottom": {"time": None, "price": 0.0},
-    "short_top": {"time": None, "price": 0.0},
-    "short_bottom": {"time": None, "price": 0.0},
+    "resistance": {"time": None, "price": 0.0},
+    "support": {"time": None, "price": 0.0},
     "range": {"time": None, "price": 0.0},
 }
 
-COOLDOWN_HOURS = 1  # 同じ種類の通知を再送するまでの待機時間
-THRESHOLD = 0.10    # 現在価格と壁の間のしきい値 (0.1円 = 10pips以内なら接近とみなす)
-RANGE_THRESHOLD = 0.10 # レンジ幅のしきい値(高値と安値の差が30pips以内ならレンジと判定)
+# ===== 設定パラメータ =====
+COOLDOWN_HOURS = 1       # 同じ種類の通知を再送するまでの待機時間
+THRESHOLD = 0.10         # 現在価格と壁ゾーンの間のしきい値 (0.1円 = 10pips)
+ZONE_MERGE_PIPS = 0.05   # 壁をグループ化する際の許容幅 (5pips以内は同一ゾーンとみなす)
+SWING_WINDOW = 5         # スイングポイント検出の左右の確認本数
 
+
+# ===== ① LINE送信 =====
 def send_line_message(message: str):
     if not line_client:
         print("[WARNING] LINE_CHANNEL_ACCESS_TOKEN が設定されていません。LINEへの通知はスキップされます。")
         return
-        
+
     try:
         broadcast_request = BroadcastRequest(
             messages=[TextMessage(text=message.replace("\\n", "\n"))]
@@ -59,11 +61,13 @@ def send_line_message(message: str):
         if hasattr(e, 'body'):
             print(f"Error Details: {e.body}")
 
+
+# ===== ② Gemini AI分析 =====
 def get_ai_analysis(market_context: str) -> str:
     """Gemini APIを使って相場状況を分析させる"""
     if not ai_client:
         return ""
-        
+
     prompt = f"""
 あなたは優秀なFX（ドル円）の専属アナリストです。
 以下の現在の相場状況に基づいて、トレーダーに向けて【端的で客観的な一言アドバイス】を書いてください。
@@ -82,153 +86,361 @@ def get_ai_analysis(market_context: str) -> str:
         print(f"Gemini APIエラー: {e}")
         return ""
 
+
+# ===== ③ クールダウン =====
 def can_notify(notify_type: str, current_price: float) -> bool:
     """同じゾーンでのスパム通知を防ぐためのロジック"""
     now = datetime.now()
     last = last_notified[notify_type]
-    
+
     if last["time"] is None or (now - last["time"]) > timedelta(hours=COOLDOWN_HOURS):
         return True
-    
-    # 連続通知防止
     return False
 
 def update_notify_state(notify_type: str, current_price: float):
     last_notified[notify_type]["time"] = datetime.now()
     last_notified[notify_type]["price"] = current_price
 
-def extract_levels(df: pd.DataFrame, window_size: int):
-    """ローリングを使って山（天井）と谷（底）を抽出する"""
-    if df.empty or len(df) < window_size * 2 + 1:
-        return [], []
-        
+
+# ===== ④ Stage 1: スイングポイント検出（プライスアクション） =====
+def detect_swing_points(df: pd.DataFrame, window: int):
+    """
+    確定済みスイングハイ/ローを検出する。
+    各ポイントに価格・時刻・ヒゲ比率・タイプを返す。
+    window: 左右何本の足で比較するか
+    """
+    if df.empty or len(df) < window * 2 + 1:
+        return []
+
     df = df.copy()
-    rolling_max = df['High'].rolling(window=window_size*2+1, center=True).max()
-    rolling_min = df['Low'].rolling(window=window_size*2+1, center=True).min()
-    
-    # 前後の指定期間内で一番高い/低い場合、そこをピーク/ボトムとする
-    df['Top'] = df['High'][df['High'] == rolling_max]
-    df['Bottom'] = df['Low'][df['Low'] == rolling_min]
-    
-    tops = df['Top'].dropna().tolist()
-    bottoms = df['Bottom'].dropna().tolist()
-    return tops, bottoms
+    points = []
 
-def check_proximity(current_price: float, levels: list, threshold: float):
-    """現在価格が過去の壁に近づいているかチェックし、最も近い壁を返す"""
-    closest_level = None
-    min_diff = float('inf')
-    
-    for level in levels:
-        diff = abs(current_price - level)
-        if diff <= threshold and diff < min_diff:
-            min_diff = diff
-            closest_level = level
-            
-    return closest_level
+    # 確定済みのスイングポイントのみ（最新のwindow本は未確定なので除外）
+    for i in range(window, len(df) - window):
+        row = df.iloc[i]
+        high = float(row['High'])
+        low = float(row['Low'])
+        open_price = float(row['Open'])
+        close = float(row['Close'])
+        timestamp = df.index[i]
 
-def is_in_range(df: pd.DataFrame, max_range_pips: float):
-    """指定期間の最高値と最安値の差が一定以内であればレンジ相場と判定する"""
-    if df.empty:
-        return False, 0, 0
-    max_price = df['High'].max()
-    min_price = df['Low'].min()
-    if (max_price - min_price) <= max_range_pips:
-        return True, max_price, min_price
-    return False, max_price, min_price
+        body = abs(close - open_price)
+        if body < 0.001:
+            body = 0.001  # ゼロ除算防止
 
+        # --- スイングハイ（天井）判定 ---
+        is_swing_high = True
+        for j in range(i - window, i + window + 1):
+            if j == i:
+                continue
+            if float(df.iloc[j]['High']) > high:
+                is_swing_high = False
+                break
+
+        if is_swing_high:
+            upper_wick = high - max(open_price, close)
+            wick_ratio = upper_wick / body
+            points.append({
+                "price": high,
+                "timestamp": timestamp,
+                "wick_ratio": round(wick_ratio, 2),
+                "type": "resistance",
+                "high": high,
+                "low": low,
+                "open": open_price,
+                "close": close,
+            })
+
+        # --- スイングロー（底）判定 ---
+        is_swing_low = True
+        for j in range(i - window, i + window + 1):
+            if j == i:
+                continue
+            if float(df.iloc[j]['Low']) < low:
+                is_swing_low = False
+                break
+
+        if is_swing_low:
+            lower_wick = min(open_price, close) - low
+            wick_ratio = lower_wick / body
+            points.append({
+                "price": low,
+                "timestamp": timestamp,
+                "wick_ratio": round(wick_ratio, 2),
+                "type": "support",
+                "high": high,
+                "low": low,
+                "open": open_price,
+                "close": close,
+            })
+
+    return points
+
+
+# ===== ⑤ Stage 2: 壁のグループ化 + 反応回数カウント =====
+def group_price_zones(swing_points: list, merge_distance: float):
+    """
+    近い価格帯（merge_distance以内）のスイングポイントを1つのゾーンに統合する。
+    反応回数・ヒゲの質から強さ（★）を算出。
+    """
+    if not swing_points:
+        return []
+
+    # 価格でソート
+    sorted_points = sorted(swing_points, key=lambda x: x["price"])
+
+    zones = []
+    current_zone = {
+        "points": [sorted_points[0]],
+        "type": sorted_points[0]["type"],
+    }
+
+    for point in sorted_points[1:]:
+        # 同じゾーン内（merge_distance以内）かつ同じタイプならマージ
+        zone_avg = sum(p["price"] for p in current_zone["points"]) / len(current_zone["points"])
+        if abs(point["price"] - zone_avg) <= merge_distance and point["type"] == current_zone["type"]:
+            current_zone["points"].append(point)
+        else:
+            zones.append(current_zone)
+            current_zone = {
+                "points": [point],
+                "type": point["type"],
+            }
+    zones.append(current_zone)
+
+    # ゾーンの統計情報を算出
+    result = []
+    for zone in zones:
+        pts = zone["points"]
+        reaction_count = len(pts)
+        avg_price = sum(p["price"] for p in pts) / reaction_count
+        avg_wick = sum(p["wick_ratio"] for p in pts) / reaction_count
+
+        # 強さ判定: 反応回数 + ヒゲの質
+        # 反応1回=★, 2回=★★, 3回以上=★★★
+        # ヒゲ比率が2.0以上なら+★（上限★★★）
+        stars = min(reaction_count, 3)
+        if avg_wick >= 2.0 and stars < 3:
+            stars += 1
+
+        # 反応履歴（新しい順）
+        reactions = sorted(pts, key=lambda x: x["timestamp"], reverse=True)
+
+        result.append({
+            "zone_price": round(avg_price, 3),
+            "type": zone["type"],
+            "reaction_count": reaction_count,
+            "strength": stars,
+            "strength_str": "★" * stars,
+            "avg_wick_ratio": round(avg_wick, 2),
+            "reactions": reactions,
+        })
+
+    return result
+
+
+# ===== ⑥ Stage 3: メッセージ生成 =====
+def build_alert_message(zone: dict, current_price: float, alert_type: str) -> tuple:
+    """
+    壁ゾーンの情報からLINE通知メッセージとAIコンテキストを生成する。
+    alert_type: "resistance", "support", "range"
+    """
+    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    zone_price = zone["zone_price"]
+    diff_pips = abs(current_price - zone_price) * 100  # 円→pips変換
+
+    if alert_type == "resistance":
+        emoji = "🔥"
+        label = "強い天井（レジスタンス帯）"
+        action = "反発下落の可能性があります"
+    elif alert_type == "support":
+        emoji = "🔥"
+        label = "強い底（サポート帯）"
+        action = "反発上昇の可能性があります"
+    else:
+        emoji = "⚠️"
+        label = "膠着状態（レンジ）"
+        action = "ブレイクアウトに警戒してください"
+
+    msg = f"📊 ドル円アラート（{now_str}）\n\n"
+    msg += f"【{emoji}{label}】{zone_price:.2f}円付近に接近中\n"
+    msg += f"　壁の強さ: {zone['strength_str']}（過去{zone['reaction_count']}回反発）\n"
+    msg += f"　現在価格: {current_price:.2f}円（壁まで{diff_pips:.0f}pips）\n"
+    msg += f"\n【根拠】\n"
+
+    # 過去の反応履歴（最大3件）
+    for reaction in zone["reactions"][:3]:
+        ts = reaction["timestamp"]
+        if hasattr(ts, 'strftime'):
+            ts_str = ts.strftime("%m/%d %H:%M")
+        else:
+            ts_str = str(ts)[:16]
+
+        wick = reaction["wick_ratio"]
+        if reaction["type"] == "resistance":
+            if wick >= 2.0:
+                desc = "長い上ヒゲで強く反落"
+            elif wick >= 1.0:
+                desc = "上ヒゲで反落"
+            else:
+                desc = "実体で到達後に反落"
+        else:
+            if wick >= 2.0:
+                desc = "長い下ヒゲで強く反発"
+            elif wick >= 1.0:
+                desc = "下ヒゲで反発"
+            else:
+                desc = "実体で到達後に反発"
+
+        msg += f"・{ts_str} {desc}（{reaction['price']:.2f}円）\n"
+
+    msg += f"\n※{action}"
+
+    ai_context = (
+        f"現在価格{current_price:.2f}円。"
+        f"{zone_price:.2f}円付近の{label}に接近中。"
+        f"過去{zone['reaction_count']}回反発しており、壁の強さは{zone['strength_str']}。"
+        f"壁までの距離は{diff_pips:.0f}pips。"
+    )
+
+    return msg, ai_context
+
+
+def build_range_message(res_zone: dict, sup_zone: dict, current_price: float) -> tuple:
+    """天井と底の両方に挟まれている場合のレンジメッセージ"""
+    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    range_width = abs(res_zone["zone_price"] - sup_zone["zone_price"]) * 100
+
+    msg = f"📊 ドル円アラート（{now_str}）\n\n"
+    msg += f"【⚠️膠着状態】天井と底に挟まれています\n"
+    msg += f"　天井: {res_zone['zone_price']:.2f}円 {res_zone['strength_str']}（{res_zone['reaction_count']}回反発）\n"
+    msg += f"　底　: {sup_zone['zone_price']:.2f}円 {sup_zone['strength_str']}（{sup_zone['reaction_count']}回反発）\n"
+    msg += f"　現在: {current_price:.2f}円\n"
+    msg += f"　レンジ幅: 約{range_width:.0f}pips\n"
+    msg += f"\n※力を溜めている状態です。どちらかにブレイクアウトする可能性が高まっています。"
+
+    ai_context = (
+        f"現在価格{current_price:.2f}円。"
+        f"レジスタンス{res_zone['zone_price']:.2f}円（{res_zone['strength_str']}）と"
+        f"サポート{sup_zone['zone_price']:.2f}円（{sup_zone['strength_str']}）に挟まれた"
+        f"約{range_width:.0f}pipsの狭いレンジ。ブレイクアウト警戒。"
+    )
+
+    return msg, ai_context
+
+
+# ===== ⑦ メインの分析タスク =====
 def run_analysis_task(force: bool = False):
     print(f"[{datetime.now()}] 価格チェックを開始します... (force={force})")
-    
+
     try:
         ticker = yf.Ticker('JPY=X')
-        
-        # 1. 短期データ（過去2日、15分足）の取得と壁の抽出
-        # 左右5本（=1時間15分）の中で最高値・最安値となるポイントを壁（短期）とみなす
-        df_short = ticker.history(period='2d', interval='15m')
-        short_tops, short_bottoms = extract_levels(df_short, window_size=5)
-        
-        # 2. 長期データ（過去14日、1時間足）の取得と壁の抽出
-        # 左右10本（=10時間）の中で最高値・最安値となるポイントを壁（中長期）とみなす
-        df_long = ticker.history(period='14d', interval='1h')
-        long_tops, long_bottoms = extract_levels(df_long, window_size=10)
 
-        # 3. 超短期のレンジ判定（過去12時間、15分足）
-        df_very_short = df_short.tail(48) # 15分足×48本 ＝ 12時間
+        # データ取得: 過去5日の15分足（スイング検出に十分な本数を確保）
+        df = ticker.history(period='5d', interval='15m')
 
-        if df_short.empty or df_long.empty:
+        if df.empty:
             print("yfinanceから価格データの取得に失敗しました。")
             return
-            
+
         try:
-            # yfinanceの最新のリアルタイム価格（fast_info）を取得
             current_price = ticker.fast_info['lastPrice']
         except Exception:
-            # 取得に失敗した場合は、15分足の最後の終値をフォールバックとして使用
-            current_price = float(df_short['Close'].iloc[-1].item()) if hasattr(df_short['Close'].iloc[-1], 'item') else float(df_short['Close'].iloc[-1])
-            
+            current_price = float(df['Close'].iloc[-1].item()) if hasattr(df['Close'].iloc[-1], 'item') else float(df['Close'].iloc[-1])
+
         print(f"現在価格: {current_price:.3f}円")
-        
-        message = ""
-        ai_context = ""
-        
+
         # --- 強制テスト通知 ---
         if force:
-            test_msg = f"\\n【🔧テスト通知】Renderからの手動トリガー成功！\\n現在価格: {current_price:.2f}円\\n※相場状況にかかわらず強制送信しました。"
-            test_context = f"現在価格は{current_price:.2f}円です。これはシステムのテスト送信です。"
+            # テスト時でも新ロジックの結果を含めて送信
+            swing_points = detect_swing_points(df, window=SWING_WINDOW)
+            zones = group_price_zones(swing_points, ZONE_MERGE_PIPS)
+
+            res_zones = [z for z in zones if z["type"] == "resistance"]
+            sup_zones = [z for z in zones if z["type"] == "support"]
+
+            test_msg = f"📊【🔧テスト通知】（{datetime.now().strftime('%Y/%m/%d %H:%M')}）\n\n"
+            test_msg += f"現在価格: {current_price:.2f}円\n"
+            test_msg += f"検出されたスイングポイント: {len(swing_points)}個\n"
+            test_msg += f"統合後のゾーン: {len(zones)}個\n\n"
+
+            if res_zones:
+                nearest_res = min(res_zones, key=lambda z: abs(z["zone_price"] - current_price))
+                test_msg += f"最寄りのレジスタンス: {nearest_res['zone_price']:.2f}円 {nearest_res['strength_str']}\n"
+            if sup_zones:
+                nearest_sup = min(sup_zones, key=lambda z: abs(z["zone_price"] - current_price))
+                test_msg += f"最寄りのサポート: {nearest_sup['zone_price']:.2f}円 {nearest_sup['strength_str']}\n"
+
+            test_context = f"現在価格は{current_price:.2f}円です。テスト送信です。"
             test_msg += get_ai_analysis(test_context)
             send_line_message(test_msg)
             print("強制テスト通知を送信しました。")
             return
 
-        # --- レンジ判定 ---
-        in_range, range_top, range_bottom = is_in_range(df_very_short, RANGE_THRESHOLD)
-        if in_range and can_notify("range", current_price):
-            message += f"\n【📉レンジ相場】直近12時間は狭いレンジ（もみ合い）になっています！\n上限: {range_top:.2f}円\n下限: {range_bottom:.2f}円\n現在価格: {current_price:.2f}円\n※ブレイクアウトにご注意ください。"
-            ai_context = f"過去12時間は {range_bottom:.2f}円から{range_top:.2f}円のレンジ相場。現在価格は{current_price:.2f}円。"
-            update_notify_state("range", current_price)
+        # ===== プライスアクション分析パイプライン =====
 
-        # --- 長期の強い壁を優先的に判定 ---
-        closest_long_top = check_proximity(current_price, long_tops, THRESHOLD)
-        if closest_long_top and can_notify("long_top", current_price):
-            base_msg = f"\n【🔥激アツ】過去14日間の強い天井（レジスタンス帯）に接近中！\n壁の価格: {closest_long_top:.2f}円\n現在価格: {current_price:.2f}円"
-            message += base_msg + "\n※反発下落の可能性が高まっています。"
-            ai_context = f"現在価格{current_price:.2f}円。過去14日間の強力なレジスタンス({closest_long_top:.2f}円)に接近中。"
-            update_notify_state("long_top", current_price)
+        # Step 1: スイングポイント検出
+        swing_points = detect_swing_points(df, window=SWING_WINDOW)
+        print(f"検出されたスイングポイント: {len(swing_points)}個")
 
-        closest_long_bottom = check_proximity(current_price, long_bottoms, THRESHOLD)
-        if closest_long_bottom and can_notify("long_bottom", current_price):
-            base_msg = f"\n【🔥激アツ】過去14日間の強い底（サポート帯）に接近中！\n壁の価格: {closest_long_bottom:.2f}円\n現在価格: {current_price:.2f}円"
-            message += base_msg + "\n※反発上昇の可能性が高まっています。"
-            ai_context = f"現在価格{current_price:.2f}円。過去14日間の強力なサポート({closest_long_bottom:.2f}円)に接近中。"
-            update_notify_state("long_bottom", current_price)
-            
-        # --- 短期の直近の壁を判定（長期壁がなければ） ---
-        if not message and not in_range:
-            closest_short_top = check_proximity(current_price, short_tops, THRESHOLD)
-            if closest_short_top and can_notify("short_top", current_price):
-                message += f"\n【⚠️注意】過去2日間の直近の天井に接近中！\n壁の価格: {closest_short_top:.2f}円\n現在価格: {current_price:.2f}円"
-                ai_context = f"現在価格{current_price:.2f}円。直近2日間のレジスタンス({closest_short_top:.2f}円)に接近中。"
-                update_notify_state("short_top", current_price)
+        if not swing_points:
+            print("スイングポイントが検出されませんでした。")
+            return
 
-            closest_short_bottom = check_proximity(current_price, short_bottoms, THRESHOLD)
-            if closest_short_bottom and can_notify("short_bottom", current_price):
-                message += f"\n【⚠️注意】過去2日間の直近の底に接近中！\n壁の価格: {closest_short_bottom:.2f}円\n現在価格: {current_price:.2f}円"
-                ai_context = f"現在価格{current_price:.2f}円。直近2日間のサポート({closest_short_bottom:.2f}円)に接近中。"
-                update_notify_state("short_bottom", current_price)
+        # Step 2: ゾーングループ化
+        zones = group_price_zones(swing_points, ZONE_MERGE_PIPS)
+        print(f"統合後のゾーン: {len(zones)}個")
 
-        # メッセージがあればAIに分析させて送信
+        for z in zones:
+            print(f"  [{z['type']}] {z['zone_price']:.3f}円 {z['strength_str']} (反応{z['reaction_count']}回, ヒゲ比率{z['avg_wick_ratio']:.1f})")
+
+        # Step 3: 現在価格に最も近い壁を判定
+        res_zones = [z for z in zones if z["type"] == "resistance" and z["zone_price"] >= current_price - THRESHOLD]
+        sup_zones = [z for z in zones if z["type"] == "support" and z["zone_price"] <= current_price + THRESHOLD]
+
+        # 現在価格からTHRESHOLD以内のゾーンだけに絞る
+        nearby_res = [z for z in res_zones if abs(z["zone_price"] - current_price) <= THRESHOLD]
+        nearby_sup = [z for z in sup_zones if abs(z["zone_price"] - current_price) <= THRESHOLD]
+
+        # 近い順にソート
+        nearby_res.sort(key=lambda z: abs(z["zone_price"] - current_price))
+        nearby_sup.sort(key=lambda z: abs(z["zone_price"] - current_price))
+
+        message = ""
+        ai_context = ""
+
+        # Step 4: アラート判定
+        if nearby_res and nearby_sup:
+            # 天井にも底にも挟まれている = レンジ（膠着）
+            if can_notify("range", current_price):
+                message, ai_context = build_range_message(nearby_res[0], nearby_sup[0], current_price)
+                update_notify_state("range", current_price)
+
+        elif nearby_res:
+            # レジスタンスに接近
+            if can_notify("resistance", current_price):
+                message, ai_context = build_alert_message(nearby_res[0], current_price, "resistance")
+                update_notify_state("resistance", current_price)
+
+        elif nearby_sup:
+            # サポートに接近
+            if can_notify("support", current_price):
+                message, ai_context = build_alert_message(nearby_sup[0], current_price, "support")
+                update_notify_state("support", current_price)
+
+        # Step 5: メッセージ送信
         if message:
             if ai_context:
                 message += get_ai_analysis(ai_context)
-                
+
             send_line_message(message)
-            print("通知を送信しました:" + message)
+            print("通知を送信しました:\n" + message)
         else:
-            print("現在はサポート/レジスタンスラインから離れています。またはレンジ内です。")
+            print("現在はサポート/レジスタンスラインから離れています。通知不要です。")
 
     except Exception as e:
         print(f"エラーが発生しました: {e}")
+
 
 @router.get("/fx_health")
 def read_root():
