@@ -4,14 +4,22 @@ import yfinance as yf
 from fastapi import APIRouter, BackgroundTasks
 import requests
 import pandas as pd
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, BroadcastRequest, TextMessage
 
 from google import genai
 
 router = APIRouter()
 
-# 環境変数
-LINE_NOTIFY_TOKEN = os.environ.get("LINE_NOTIFY_TOKEN", "")
+# 環境変数 (LINE Messaging API と Gemini API)
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# LINE Messaging API クライアントの初期化
+line_client = None
+if LINE_CHANNEL_ACCESS_TOKEN:
+    configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+    api_client = ApiClient(configuration)
+    line_client = MessagingApi(api_client)
 
 # Geminiクライアントの初期化 (APIキーがあれば)
 ai_client = None
@@ -31,17 +39,19 @@ COOLDOWN_HOURS = 2  # 同じ種類の通知を再送するまでの待機時間
 THRESHOLD = 0.10    # 現在価格と壁の間のしきい値 (0.1円 = 10pips以内なら接近とみなす)
 RANGE_THRESHOLD = 0.30 # レンジ幅のしきい値(高値と安値の差が30pips以内ならレンジと判定)
 
-def send_line_notify(message: str):
-    if not LINE_NOTIFY_TOKEN:
-        print("[WARNING] LINE_NOTIFY_TOKEN が設定されていません。通知はスキップされます。")
+def send_line_message(message: str):
+    if not line_client:
+        print("[WARNING] LINE_CHANNEL_ACCESS_TOKEN が設定されていません。LINEへの通知はスキップされます。")
         return
-    url = "https://notify-api.line.me/api/notify"
-    headers = {"Authorization": f"Bearer {LINE_NOTIFY_TOKEN}"}
-    data = {"message": message}
+        
     try:
-        requests.post(url, headers=headers, data=data)
+        broadcast_request = BroadcastRequest(
+            messages=[TextMessage(text=message)]
+        )
+        line_client.broadcast(broadcast_request)
+        print("LINE Messaging API (Broadcast) 経由で通知を送信しました。")
     except Exception as e:
-        print(f"LINE Notify送信エラー: {e}")
+        print(f"LINE Messaging API 送信エラー: {e}")
 
 def get_ai_analysis(market_context: str) -> str:
     """Gemini APIを使って相場状況を分析させる"""
@@ -197,7 +207,7 @@ def run_analysis_task():
             if ai_context:
                 message += get_ai_analysis(ai_context)
                 
-            send_line_notify(message)
+            send_line_message(message)
             print("通知を送信しました:" + message)
         else:
             print("現在はサポート/レジスタンスラインから離れています。またはレンジ内です。")
