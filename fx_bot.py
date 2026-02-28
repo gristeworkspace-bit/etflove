@@ -38,9 +38,9 @@ last_notified = {
     "range": {"time": None, "price": 0.0},
 }
 
-COOLDOWN_HOURS = 2  # 同じ種類の通知を再送するまでの待機時間
+COOLDOWN_HOURS = 1  # 同じ種類の通知を再送するまでの待機時間
 THRESHOLD = 0.10    # 現在価格と壁の間のしきい値 (0.1円 = 10pips以内なら接近とみなす)
-RANGE_THRESHOLD = 0.30 # レンジ幅のしきい値(高値と安値の差が30pips以内ならレンジと判定)
+RANGE_THRESHOLD = 0.10 # レンジ幅のしきい値(高値と安値の差が30pips以内ならレンジと判定)
 
 def send_line_message(message: str):
     if not line_client:
@@ -49,7 +49,7 @@ def send_line_message(message: str):
         
     try:
         broadcast_request = BroadcastRequest(
-            messages=[TextMessage(text=message)]
+            messages=[TextMessage(text=message.replace("\\n", "\n"))]
         )
         print("Sending BroadcastRequest to LINE API...")
         response = line_client.broadcast(broadcast_request)
