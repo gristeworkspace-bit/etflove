@@ -629,10 +629,19 @@ def run_analysis_task(force: bool = False):
         all_res = [z for z in zones if z["type"] == "resistance"]
         all_sup = [z for z in zones if z["type"] == "support"]
 
-        # 上方ブレイクアウト: 現在価格がレジスタンスゾーンを BREAKOUT_MARGIN 以上超えている
-        broken_res = [z for z in all_res if current_price > z["zone_price"] + BREAKOUT_MARGIN]
-        # 下方ブレイクアウト: 現在価格がサポートゾーンを BREAKOUT_MARGIN 以上下回っている
-        broken_sup = [z for z in all_sup if current_price < z["zone_price"] - BREAKOUT_MARGIN]
+        # 直近の確定足（1本前）の終値を取得して、今まさに壁を抜けたのかを確認
+        prev_close = float(df['Close'].iloc[-2]) if len(df) > 1 else current_price
+
+        # 上方ブレイクアウト: 1本前は壁の下におり、現在は壁を BREAKOUT_MARGIN 以上突破している
+        broken_res = [
+            z for z in all_res 
+            if prev_close <= z["zone_price"] and current_price > z["zone_price"] + BREAKOUT_MARGIN
+        ]
+        # 下方ブレイクアウト: 1本前は壁の上におり、現在は壁を BREAKOUT_MARGIN 以上下回っている
+        broken_sup = [
+            z for z in all_sup 
+            if prev_close >= z["zone_price"] and current_price < z["zone_price"] - BREAKOUT_MARGIN
+        ]
 
         if broken_res:
             # 最も高い（=最も重要な）突破されたレジスタンスを選択
