@@ -720,17 +720,17 @@ def start_scheduler():
         return
 
     _scheduler = BackgroundScheduler(daemon=True)
-    # 月〜金の毎分0秒に実行
+    # FX相場のアラートタスクを平日（月〜金）の5分ごと（0,5,10...分）に実行
     _scheduler.add_job(
         run_analysis_task,
-        CronTrigger(day_of_week='mon-fri', minute='*', second='0'),
+        CronTrigger(day_of_week='mon-fri', minute='*/5', second='0'),
         id='fx_analysis',
         name='FX価格分析（1分間隔）',
         replace_existing=True,
         misfire_grace_time=30,  # 30秒以内の遅延は許容
     )
     _scheduler.start()
-    print("[SCHEDULER] FX分析スケジューラーを起動しました（平日1分間隔）")
+    print("[SCHEDULER] FX分析スケジューラーを起動しました（平日5分間隔）")
 
 
 def stop_scheduler():
