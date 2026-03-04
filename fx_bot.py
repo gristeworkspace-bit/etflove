@@ -4,13 +4,18 @@ import yfinance as yf
 from fastapi import APIRouter, BackgroundTasks
 import requests
 import pandas as pd
+import pytz
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, BroadcastRequest, TextMessage
 
+from google import genai
 from google import genai
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 router = APIRouter()
+
+# タイムゾーンの設定 (JST)
+JST = pytz.timezone('Asia/Tokyo')
 
 # 環境変数 (LINE Messaging API と Gemini API)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -38,6 +43,8 @@ last_notified = {
     "range": {"time": None, "price": 0.0},
     "breakout_up": {"time": None, "price": 0.0},
     "breakout_down": {"time": None, "price": 0.0},
+    "trend_up": {"time": None, "price": 0.0},
+    "trend_down": {"time": None, "price": 0.0},
 }
 
 # ===== 設定パラメータ =====
@@ -103,7 +110,7 @@ def get_ai_analysis(market_context: str) -> str:
 # ===== ③ クールダウン =====
 def can_notify(notify_type: str, current_price: float) -> bool:
     """同じゾーンでのスパム通知を防ぐためのロジック"""
-    now = datetime.now()
+    now = datetime.now(JST)
     last = last_notified[notify_type]
     
     cooldown = TREND_COOLDOWN_HOURS if notify_type.startswith("trend_") else COOLDOWN_HOURS
@@ -113,7 +120,7 @@ def can_notify(notify_type: str, current_price: float) -> bool:
     return False
 
 def update_notify_state(notify_type: str, current_price: float):
-    last_notified[notify_type]["time"] = datetime.now()
+    last_notified[notify_type]["time"] = datetime.now(JST)
     last_notified[notify_type]["price"] = current_price
 
 
@@ -293,7 +300,7 @@ def build_alert_message(zone: dict, current_price: float, alert_type: str) -> tu
     壁ゾーンの情報からLINE通知メッセージとAIコンテキストを生成する。
     alert_type: "resistance", "support", "range"
     """
-    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
     zone_price = zone["zone_price"]
     diff_pips = abs(current_price - zone_price) * 100  # 円→pips変換
 
@@ -319,6 +326,8 @@ def build_alert_message(zone: dict, current_price: float, alert_type: str) -> tu
     # 過去の反応履歴（最大3件）
     for reaction in zone["reactions"][:3]:
         ts = reaction["timestamp"]
+        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+            ts = ts.astimezone(JST)
         if hasattr(ts, 'strftime'):
             ts_str = ts.strftime("%m/%d %H:%M")
         else:
@@ -357,7 +366,7 @@ def build_alert_message(zone: dict, current_price: float, alert_type: str) -> tu
 
 def build_range_message(res_zone: dict, sup_zone: dict, current_price: float) -> tuple:
     """天井と底の両方に挟まれている場合のレンジメッセージ"""
-    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
     range_width = abs(res_zone["zone_price"] - sup_zone["zone_price"]) * 100
 
     msg = f"📊 ドル円アラート（{now_str}）\n\n"
@@ -384,7 +393,7 @@ def build_breakout_message(zone: dict, current_price: float, direction: str) -> 
     壁を突き抜けた場合のブレイクアウト通知メッセージを生成する。
     direction: "up"（上方ブレイク）or "down"（下方ブレイク）
     """
-    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
     zone_price = zone["zone_price"]
     diff_pips = abs(current_price - zone_price) * 100
 
@@ -408,6 +417,8 @@ def build_breakout_message(zone: dict, current_price: float, direction: str) -> 
     # 過去の反応履歴（最大3件）
     for reaction in zone["reactions"][:3]:
         ts = reaction["timestamp"]
+        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+            ts = ts.astimezone(JST)
         if hasattr(ts, 'strftime'):
             ts_str = ts.strftime("%m/%d %H:%M")
         else:
@@ -429,7 +440,7 @@ def build_breakout_message(zone: dict, current_price: float, direction: str) -> 
 # ===== ⑥-C: トレンドメッセージ生成 (プライスアクション版) =====
 def build_trend_message(trend_info: dict, current_price: float) -> tuple:
     """トレンド発生/継続時のLINE通知メッセージを作成"""
-    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
     
     if trend_info["status"] == "up":
         emoji = "📈"
@@ -515,13 +526,13 @@ def build_full_ai_context(df: pd.DataFrame, current_price: float, zones: list, a
 
 # ===== ⑦ メインの分析タスク =====
 def run_analysis_task(force: bool = False):
-    print(f"[{datetime.now()}] 価格チェックを開始します... (force={force})")
+    now_jst = datetime.now(JST)
+    print(f"[{now_jst}] 価格チェックを開始します... (force={force})")
 
     # 土日は通知をスキップ（FXは土日休場のため）
     # force=True の場合はテスト用にスキップしない
-    now = datetime.now()
-    if not force and now.weekday() in (5, 6):  # 5=Saturday, 6=Sunday
-        print(f"本日は{'土曜日' if now.weekday() == 5 else '日曜日'}のため、通知をスキップします。")
+    if not force and now_jst.weekday() in (5, 6):  # 5=Saturday, 6=Sunday
+        print(f"本日は{'土曜日' if now_jst.weekday() == 5 else '日曜日'}のため、通知をスキップします。")
         return
 
     try:
@@ -550,7 +561,7 @@ def run_analysis_task(force: bool = False):
             res_zones = [z for z in zones if z["type"] == "resistance"]
             sup_zones = [z for z in zones if z["type"] == "support"]
 
-            test_msg = f"📊【🔧テスト通知】（{datetime.now().strftime('%Y/%m/%d %H:%M')}）\n\n"
+            test_msg = f"📊【🔧テスト通知】（{datetime.now(JST).strftime('%Y/%m/%d %H:%M')}）\n\n"
             test_msg += f"現在価格: {current_price:.2f}円\n"
             test_msg += f"検出された反発ポイント: {len(swing_points)}個\n"
             test_msg += f"意識される価格帯: {len(zones)}個\n\n"
