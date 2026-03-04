@@ -42,6 +42,7 @@ last_notified = {
 
 # ===== 設定パラメータ =====
 COOLDOWN_HOURS = 1       # 同じ種類の通知を再送するまでの待機時間
+TREND_COOLDOWN_HOURS = 4 # トレンド通知を再送するまでの待機時間(長め)
 THRESHOLD = 0.10         # 現在価格と壁ゾーンの間のしきい値 (0.1円 = 10pips)
 ZONE_MERGE_PIPS = 0.05   # 壁をグループ化する際の許容幅 (5pips以内は同一ゾーンとみなす)
 BREAKOUT_MARGIN = 0.05   # 壁をこの値（5pips）以上超えたらブレイクアウト確定とみなす
@@ -104,8 +105,10 @@ def can_notify(notify_type: str, current_price: float) -> bool:
     """同じゾーンでのスパム通知を防ぐためのロジック"""
     now = datetime.now()
     last = last_notified[notify_type]
+    
+    cooldown = TREND_COOLDOWN_HOURS if notify_type.startswith("trend_") else COOLDOWN_HOURS
 
-    if last["time"] is None or (now - last["time"]) > timedelta(hours=COOLDOWN_HOURS):
+    if last["time"] is None or (now - last["time"]) > timedelta(hours=cooldown):
         return True
     return False
 
@@ -251,6 +254,39 @@ def group_price_zones(swing_points: list, merge_distance: float):
     return result
 
 
+# ===== ⑤-B Stage 2.5: トレンド判定 (プライスアクション / ダウ理論) =====
+def analyze_trend_pa(swing_points: list) -> dict:
+    """
+    スイングハイ・ローの切り上げ・切り下げ（ダウ理論）を用いて現在のトレンド状態を判定する。
+    戻り値: {"status": "up"|"down"|"neutral", "details": str}
+    """
+    # 昇順（古い順）にソート
+    sorted_pts = sorted(swing_points, key=lambda x: x["timestamp"])
+    
+    highs = [p for p in sorted_pts if p["type"] == "resistance"]
+    lows = [p for p in sorted_pts if p["type"] == "support"]
+    
+    # 高値・安値のそれぞれが直近2個以上あるか確認
+    if len(highs) < 2 or len(lows) < 2:
+        return {"status": "neutral", "details": "トレンドを判定するためのスイングポイントが不足しています"}
+
+    # 直近の高値と、その1個前の高値を比較 (High1 = 古い, High2 = 新しい)
+    high1, high2 = highs[-2]["price"], highs[-1]["price"]
+    # 直近の安値と、その1個前の安値を比較 (Low1 = 古い, Low2 = 新しい)
+    low1, low2 = lows[-2]["price"], lows[-1]["price"]
+
+    # 上昇トレンド定義: 高値の切り上げ (Higher High) AND 安値の切り上げ (Higher Low)
+    if high2 > high1 and low2 > low1:
+        return {"status": "up", "details": "高値と安値が切り上がっています（上昇のダウ成立）"}
+        
+    # 下落トレンド定義: 高値の切り下げ (Lower High) AND 安値の切り下げ (Lower Low)
+    if high2 < high1 and low2 < low1:
+        return {"status": "down", "details": "高値と安値が切り下がっています（下降のダウ成立）"}
+
+    # どちらでもない (レンジ、三角持ち合い、トレンド転換中など)
+    return {"status": "neutral", "details": "高値・安値の方向感が揃っていません（レンジ・または転換中）"}
+
+
 # ===== ⑥ Stage 3: メッセージ生成 =====
 def build_alert_message(zone: dict, current_price: float, alert_type: str) -> tuple:
     """
@@ -390,6 +426,36 @@ def build_breakout_message(zone: dict, current_price: float, direction: str) -> 
     return msg, ai_context
 
 
+# ===== ⑥-C: トレンドメッセージ生成 (プライスアクション版) =====
+def build_trend_message(trend_info: dict, current_price: float) -> tuple:
+    """トレンド発生/継続時のLINE通知メッセージを作成"""
+    now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+    
+    if trend_info["status"] == "up":
+        emoji = "📈"
+        trend_name = "上昇トレンド"
+        color = "買い優勢"
+    else:
+        emoji = "📉"
+        trend_name = "下落トレンド"
+        color = "売り優勢"
+        
+    msg = f"📊 ドル円トレンド通知（{now_str}）\n\n"
+    msg += f"【{emoji}{trend_name}】{color}の相場になっています\n"
+    msg += f"　サイン: {trend_info['details']}\n"
+    msg += f"　現在価格: {current_price:.2f}円\n\n"
+    
+    msg += "※ダウ理論に基づき、直近の波形（プライスアクション）からトレンドを判定しています。トレンド方向への順張りが有効な場面です。"
+
+    ai_context = (
+        f"現在価格{current_price:.2f}円。"
+        f"{trend_info['details']}のサインが出現。"
+        f"{trend_name}（{color}）と判定されました。ダウ理論に基づいたトレンド状況に合わせたアドバイスを。"
+    )
+
+    return msg, ai_context
+
+
 # ===== ⑥-B: AIに渡す豊富な相場コンテキストの構築 =====
 def build_full_ai_context(df: pd.DataFrame, current_price: float, zones: list, alert_context: str) -> str:
     """
@@ -443,7 +509,7 @@ def build_full_ai_context(df: pd.DataFrame, current_price: float, zones: list, a
         for z in sup_zones[:5]:  # 上位5つ
             dist = (z["zone_price"] - current_price) * 100
             context += f"  {z['zone_price']:.2f}円 {z['strength_str']} 反応{z['reaction_count']}回 (現在価格から{dist:+.0f}pips)\n"
-
+            
     return context
 
 
@@ -501,6 +567,11 @@ def run_analysis_task(force: bool = False):
                 test_alert_context += f"最寄りレジスタンス: {nearest_res['zone_price']:.2f}円 {nearest_res['strength_str']}。"
             if sup_zones:
                 test_alert_context += f"最寄りサポート: {nearest_sup['zone_price']:.2f}円 {nearest_sup['strength_str']}。"
+
+            # トレンド情報の追記
+            trend_info = analyze_trend_pa(swing_points)
+            if trend_info["status"] != "neutral":
+                test_alert_context += f"現在{trend_info['details']}のトレンドが発生中。"
 
             full_context = build_full_ai_context(df, current_price, zones, test_alert_context)
             test_msg += get_ai_analysis(full_context)
@@ -585,9 +656,28 @@ def run_analysis_task(force: bool = False):
                 message, ai_context = build_alert_message(nearby_sup[0], current_price, "support")
                 update_notify_state("support", current_price)
 
+        # --- 4c: トレンド判定 (プライスアクション) ---
+        # 壁への接近やブレイクアウトがない平和な時でも、明確なダウ理論成立があれば通知する
+        if not message:
+            trend_info = analyze_trend_pa(swing_points)
+            if trend_info["status"] == "up":
+                if can_notify("trend_up", current_price):
+                    message, ai_context = build_trend_message(trend_info, current_price)
+                    update_notify_state("trend_up", current_price)
+            elif trend_info["status"] == "down":
+                if can_notify("trend_down", current_price):
+                    message, ai_context = build_trend_message(trend_info, current_price)
+                    update_notify_state("trend_down", current_price)
+
         # Step 5: メッセージ送信
         if message:
             if ai_context:
+                # --- トレンド状況をAIコンテキストに追記 ---
+                if "trend_info" not in locals():
+                    trend_info = analyze_trend_pa(swing_points)
+                if trend_info["status"] != "neutral":
+                    ai_context += f"\n【現在のトレンド】\n{trend_info['details']}\n"
+                    
                 # AIに相場全体の地図も渡す
                 full_ai_context = build_full_ai_context(df, current_price, zones, ai_context)
                 message += get_ai_analysis(full_ai_context)
