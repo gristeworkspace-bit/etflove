@@ -10,3 +10,6 @@ requests-cache
 google-genai
 line-bot-sdk
 apscheduler
+scipy
+scikit-learn
+numpy
