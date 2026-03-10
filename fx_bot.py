@@ -48,12 +48,13 @@ _prev_state = {
     "trend_status": None,      # 前回のトレンド状態 ("up", "down", "neutral")
 }
 
-# クラスタの平均価格がこの割合以上変化したら「レベルが変わった」と判定
-CLUSTER_CHANGE_RATIO = 0.001  # 0.1%（例: 150円なら0.15円=15pips以上のシフト）
+# ゾーンの平均価格がこの割合以上変化したら「レベルが変わった」と判定
+ZONE_CHANGE_RATIO = 0.001  # 0.1%（例: 150円なら0.15円=15pips以上のシフト）
 
 # ===== 設定パラメータ =====
-SWING_WINDOW_MINOR = 5   # マイナースイング（トレンド判定）の検出用（5本）
+SWING_WINDOW_MINOR = 5   # マイナースイング（トレンド判定・壁検出）の検出用（5本）
 ZONE_MAX_AGE_HOURS = 48  # 壁の有効期限（直近48時間以内に形成・反応したものだけ有効）
+ZONE_MERGE_DISTANCE = 0.15  # 壁のマージ距離（0.15円 = 15pips以内なら同一ゾーン）
 
 # バックグラウンドスケジューラー
 _scheduler = None
@@ -108,35 +109,50 @@ def get_ai_analysis(market_context: str) -> str:
 
 
 # ===== ③ 変化検出ロジック =====
-def has_cluster_changed(new_res_mean: float, new_sup_mean: float) -> bool:
+def has_zone_changed(new_res_price: float, new_sup_price: float) -> bool:
     """
-    前回と比較してクラスタのレベル（天井・底の平均価格）が有意に変化したか判定する。
+    前回と比較してゾーンのレベル（天井・底の平均価格）が有意に変化したか判定する。
     初回は常にTrue（まだデータがないため）。
     """
     if _prev_state["resistance_mean"] is None or _prev_state["support_mean"] is None:
         return True
 
     # 前回の平均価格との相対変化率で判定（固定pips不使用）
-    res_change = abs(new_res_mean - _prev_state["resistance_mean"]) / _prev_state["resistance_mean"]
-    sup_change = abs(new_sup_mean - _prev_state["support_mean"]) / _prev_state["support_mean"]
+    res_change = abs(new_res_price - _prev_state["resistance_mean"]) / _prev_state["resistance_mean"]
+    sup_change = abs(new_sup_price - _prev_state["support_mean"]) / _prev_state["support_mean"]
 
-    return res_change >= CLUSTER_CHANGE_RATIO or sup_change >= CLUSTER_CHANGE_RATIO
+    return res_change >= ZONE_CHANGE_RATIO or sup_change >= ZONE_CHANGE_RATIO
 
 
-def get_price_zone(current_price: float, res: dict, sup: dict) -> str:
+def get_price_zone(current_price: float, res_zone: dict, sup_zone: dict) -> str:
     """
     現在価格がどのゾーンにいるかを判定する。
-    返り値: "above_res", "in_res", "middle", "in_sup", "below_sup"
+    res_zone, sup_zone は group_price_zones の出力形式（zone_price ベース）。
+    ゾーンの範囲はゾーン内の反応ポイントの min/max から判定する。
+    返り値: "above_res", "in_res", "middle", "in_sup", "below_sup", "range"
     """
-    if current_price > res["max"]:
+    if res_zone is None or sup_zone is None:
+        return "middle"
+
+    # ゾーンの価格範囲を取得
+    res_prices = [p["price"] for p in res_zone.get("reactions", [])]
+    sup_prices = [p["price"] for p in sup_zone.get("reactions", [])]
+    
+    # フォールバック: reactions が空の場合は zone_price を使う
+    res_max = max(res_prices) if res_prices else res_zone["zone_price"]
+    res_min = min(res_prices) if res_prices else res_zone["zone_price"]
+    sup_max = max(sup_prices) if sup_prices else sup_zone["zone_price"]
+    sup_min = min(sup_prices) if sup_prices else sup_zone["zone_price"]
+
+    if current_price > res_max:
         return "above_res"
-    elif res["min"] <= current_price <= res["max"]:
-        if sup["min"] <= current_price <= sup["max"]:
+    elif res_min <= current_price <= res_max:
+        if sup_min <= current_price <= sup_max:
             return "range"
         return "in_res"
-    elif sup["min"] <= current_price <= sup["max"]:
+    elif sup_min <= current_price <= sup_max:
         return "in_sup"
-    elif current_price < sup["min"]:
+    elif current_price < sup_min:
         return "below_sup"
     else:
         return "middle"
@@ -376,6 +392,32 @@ def group_price_zones(swing_points: list, merge_distance: float):
         })
 
     return result
+
+
+def find_nearest_zones(zones: list, current_price: float) -> dict:
+    """
+    ゾーンリストから現在価格に最も近いレジスタンスとサポートを取得する。
+    - レジスタンス: 現在価格以上にあるゾーンのうち、最も近いもの
+    - サポート: 現在価格以下にあるゾーンのうち、最も近いもの
+    戻り値: {"resistance": zone_dict or None, "support": zone_dict or None}
+    """
+    res_zones = [z for z in zones if z["type"] == "resistance" and z["zone_price"] >= current_price]
+    sup_zones = [z for z in zones if z["type"] == "support" and z["zone_price"] <= current_price]
+
+    # 現在価格より上にレジスタンスがない場合、最も高いレジスタンスを使う
+    if not res_zones:
+        res_zones = [z for z in zones if z["type"] == "resistance"]
+    # 現在価格より下にサポートがない場合、最も低いサポートを使う
+    if not sup_zones:
+        sup_zones = [z for z in zones if z["type"] == "support"]
+
+    nearest_res = min(res_zones, key=lambda z: abs(z["zone_price"] - current_price)) if res_zones else None
+    nearest_sup = min(sup_zones, key=lambda z: abs(z["zone_price"] - current_price)) if sup_zones else None
+
+    return {
+        "resistance": nearest_res,
+        "support": nearest_sup,
+    }
 
 
 # ===== ⑤-B Stage 2.5: トレンド判定 (プライスアクション / ダウ理論) =====
@@ -669,131 +711,134 @@ def run_analysis_task(force: bool = False):
 
         print(f"現在価格: {current_price:.3f}円")
 
+        # ===== スイングポイントベース分析パイプライン =====
+
+        # Step 1: スイングポイント検出 → ゾーンのグルーピング
+        swing_points = detect_swing_points(df, window=SWING_WINDOW_MINOR)
+        zones = group_price_zones(swing_points, merge_distance=ZONE_MERGE_DISTANCE)
+        nearest = find_nearest_zones(zones, current_price)
+        res_zone = nearest["resistance"]
+        sup_zone = nearest["support"]
+
+        # トレンド判定
+        trend_info = analyze_trend_pa(swing_points)
+
+        print(f"  スイングポイント: {len(swing_points)}個検出")
+        print(f"  ゾーン: {len(zones)}個（有効期限{ZONE_MAX_AGE_HOURS}時間以内）")
+        if res_zone:
+            print(f"  最寄りレジスタンス: {res_zone['zone_price']:.3f}円 {res_zone['strength_str']}（{res_zone['reaction_count']}回反発）")
+        else:
+            print("  最寄りレジスタンス: なし")
+        if sup_zone:
+            print(f"  最寄りサポート: {sup_zone['zone_price']:.3f}円 {sup_zone['strength_str']}（{sup_zone['reaction_count']}回反発）")
+        else:
+            print("  最寄りサポート: なし")
+
         # --- 強制テスト通知 ---
         if force:
-            # クラスタリングベースのサポート/レジスタンス検出を使用
-            df_recent = df.tail(32)
-            sr = detect_support_resistance(df_recent)
-
             test_msg = f"📊【🔧テスト通知】（{datetime.now(JST).strftime('%Y/%m/%d %H:%M')}）\n\n"
             test_msg += f"現在価格: {current_price:.2f}円\n"
-            test_msg += f"クラスタ数: {sr.get('optimal_k', 'N/A')}個（シルエットスコア: {sr.get('silhouette_score', 'N/A')}）\n\n"
+            test_msg += f"検出ゾーン数: {len(zones)}個\n\n"
 
-            res = sr["resistance"]
-            sup = sr["support"]
-
-            if res["count"] > 0:
-                test_msg += f"🔴 レジスタンス帯: {res['mean_price']:.2f}円（{res['min']:.2f}〜{res['max']:.2f}、{res['count']}点）\n"
-            if sup["count"] > 0:
-                test_msg += f"🟢 サポート帯: {sup['mean_price']:.2f}円（{sup['min']:.2f}〜{sup['max']:.2f}、{sup['count']}点）\n"
+            if res_zone:
+                test_msg += f"🔴 最寄りレジスタンス: {res_zone['zone_price']:.2f}円 {res_zone['strength_str']}（{res_zone['reaction_count']}回反発）\n"
+            else:
+                test_msg += "🔴 レジスタンス: 検出なし\n"
+            if sup_zone:
+                test_msg += f"🟢 最寄りサポート: {sup_zone['zone_price']:.2f}円 {sup_zone['strength_str']}（{sup_zone['reaction_count']}回反発）\n"
+            else:
+                test_msg += "🟢 サポート: 検出なし\n"
 
             test_alert_context = f"現在価格{current_price:.2f}円。テスト送信。"
-            test_alert_context += f"レジスタンス帯: {res['mean_price']:.2f}円。サポート帯: {sup['mean_price']:.2f}円。"
-
-            # トレンド情報の追記（マイナースイングを使用）
-            swing_points_minor = detect_swing_points(df, window=SWING_WINDOW_MINOR)
-            trend_info = analyze_trend_pa(swing_points_minor)
+            if res_zone:
+                test_alert_context += f"レジスタンス帯: {res_zone['zone_price']:.2f}円。"
+            if sup_zone:
+                test_alert_context += f"サポート帯: {sup_zone['zone_price']:.2f}円。"
             if trend_info["status"] != "neutral":
                 test_alert_context += f"現在{trend_info['details']}のトレンドが発生中。"
 
-            # AIコンテキスト構築（zonesは空リストを渡す ― クラスタ情報はalert_contextに含まれる）
-            full_context = build_full_ai_context(df, current_price, [], test_alert_context)
+            full_context = build_full_ai_context(df, current_price, zones, test_alert_context)
             test_msg += get_ai_analysis(full_context)
             send_line_message(test_msg)
             print("強制テスト通知を送信しました。")
             return
 
-        # ===== クラスタリングベース分析パイプライン =====
+        # Step 2: ゾーンが見つからない場合はスキップ
+        if res_zone is None and sup_zone is None:
+            print("有効なサポート/レジスタンスゾーンが見つかりません。通知をスキップします。")
+            update_prev_state(0.0, 0.0, "middle", trend_info["status"])
+            return
 
-        # Step 1: 直近32本（8時間分）でサポート/レジスタンスを検出
-        df_recent = df.tail(32)
-        sr = detect_support_resistance(df_recent)
-        res = sr["resistance"]
-        sup = sr["support"]
-        print(f"クラスタリング結果: k={sr.get('optimal_k', 'N/A')}, シルエット={sr.get('silhouette_score', 'N/A')}")
-        print(f"  レジスタンス帯: {res['mean_price']:.3f}円（{res['min']:.3f}〜{res['max']:.3f}、{res['count']}点）")
-        print(f"  サポート帯: {sup['mean_price']:.3f}円（{sup['min']:.3f}〜{sup['max']:.3f}、{sup['count']}点）")
+        # ゾーン価格（None の場合は現在価格をフォールバック）
+        res_price = res_zone["zone_price"] if res_zone else current_price + 1.0
+        sup_price = sup_zone["zone_price"] if sup_zone else current_price - 1.0
 
-        # トレンド判定用のマイナースイング
-        swing_points_minor = detect_swing_points(df, window=SWING_WINDOW_MINOR)
-        trend_info = analyze_trend_pa(swing_points_minor)
-
-        # Step 2: 変化検出 ― 前回の状態と比較
-        current_zone = get_price_zone(current_price, res, sup)
+        # Step 3: 変化検出 ― 前回の状態と比較
+        current_price_zone = get_price_zone(current_price, res_zone, sup_zone)
         prev_zone = _prev_state["price_zone"]
-        cluster_changed = has_cluster_changed(res["mean_price"], sup["mean_price"])
-        zone_changed = (prev_zone != current_zone)
+        zone_level_changed = has_zone_changed(res_price, sup_price)
+        zone_changed = (prev_zone != current_price_zone)
         trend_changed = (_prev_state["trend_status"] != trend_info["status"])
 
-        print(f"  ゾーン: {prev_zone} → {current_zone} (変化: {zone_changed})")
-        print(f"  クラスタ変化: {cluster_changed}, トレンド変化: {trend_changed}")
-
-        # クラスタ情報をゾーン辞書形式に変換（メッセージ生成関数との橋渡し）
-        def cluster_to_zone(cluster_info, zone_type):
-            return {
-                "zone_price": cluster_info["mean_price"],
-                "type": zone_type,
-                "reaction_count": cluster_info["count"],
-                "strength": min(cluster_info["count"] // 4, 3) or 1,
-                "strength_str": "★" * (min(cluster_info["count"] // 4, 3) or 1),
-                "avg_wick_ratio": 0.0,
-                "reactions": [],
-            }
-
-        res_zone = cluster_to_zone(res, "resistance")
-        sup_zone = cluster_to_zone(sup, "support")
+        print(f"  ゾーン: {prev_zone} → {current_price_zone} (変化: {zone_changed})")
+        print(f"  壁レベル変化: {zone_level_changed}, トレンド変化: {trend_changed}")
 
         message = ""
         ai_context = ""
 
-        # Step 3: 変化があった場合のみアラート判定
-        # 通知条件: ゾーンが変わった OR クラスタレベルが変わった
-
-        if zone_changed or cluster_changed:
-            # -- 3a: ブレイクアウト（ゾーンが壁の外に遷移） --
-            if current_zone == "above_res" and prev_zone != "above_res":
+        # Step 4: 変化があった場合のみアラート判定
+        if zone_changed or zone_level_changed:
+            # -- 4a: ブレイクアウト（ゾーンが壁の外に遷移） --
+            if current_price_zone == "above_res" and prev_zone != "above_res" and res_zone:
                 message, ai_context = build_breakout_message(res_zone, current_price, "up")
 
-            elif current_zone == "below_sup" and prev_zone != "below_sup":
+            elif current_price_zone == "below_sup" and prev_zone != "below_sup" and sup_zone:
                 message, ai_context = build_breakout_message(sup_zone, current_price, "down")
 
-            # -- 3b: 壁への接近（ゾーンに初めて入った） --
-            elif current_zone == "in_res":
-                if prev_zone != "in_res" or cluster_changed:
+            # -- 4b: 壁への接近（ゾーンに初めて入った） --
+            elif current_price_zone == "in_res" and res_zone:
+                if prev_zone != "in_res" or zone_level_changed:
                     message, ai_context = build_alert_message(res_zone, current_price, "resistance")
 
-            elif current_zone == "in_sup":
-                if prev_zone != "in_sup" or cluster_changed:
+            elif current_price_zone == "in_sup" and sup_zone:
+                if prev_zone != "in_sup" or zone_level_changed:
                     message, ai_context = build_alert_message(sup_zone, current_price, "support")
 
-            elif current_zone == "range":
-                if prev_zone != "range" or cluster_changed:
+            elif current_price_zone == "range" and res_zone and sup_zone:
+                if prev_zone != "range" or zone_level_changed:
                     message, ai_context = build_range_message(res_zone, sup_zone, current_price)
 
-            # -- 3c: クラスタレベルが変わった場合（ゾーンはmiddleだが壁の位置が変動） --
-            elif cluster_changed and current_zone == "middle":
+            # -- 4c: 壁レベルが変わった場合（ゾーンはmiddleだが壁の位置が変動） --
+            elif zone_level_changed and current_price_zone == "middle":
                 now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
                 message = f"📊 ドル円アラート（{now_str}）\n\n"
                 message += f"【📐市場構造の変化を検出】\n"
-                message += f"　新しい天井帯: {res['mean_price']:.2f}円（{res['min']:.2f}〜{res['max']:.2f}）\n"
-                message += f"　新しい底帯: {sup['mean_price']:.2f}円（{sup['min']:.2f}〜{sup['max']:.2f}）\n"
+                if res_zone:
+                    message += f"　新しい天井帯: {res_zone['zone_price']:.2f}円 {res_zone['strength_str']}\n"
+                if sup_zone:
+                    message += f"　新しい底帯: {sup_zone['zone_price']:.2f}円 {sup_zone['strength_str']}\n"
                 message += f"　現在価格: {current_price:.2f}円（中間帯）"
-                ai_context = f"市場構造が変化。新レジスタンス{res['mean_price']:.2f}円、新サポート{sup['mean_price']:.2f}円。現在価格{current_price:.2f}円。"
+                ai_context = f"市場構造が変化。"
+                if res_zone:
+                    ai_context += f"新レジスタンス{res_zone['zone_price']:.2f}円。"
+                if sup_zone:
+                    ai_context += f"新サポート{sup_zone['zone_price']:.2f}円。"
+                ai_context += f"現在価格{current_price:.2f}円。"
 
-        # -- 3d: トレンド変化の検出 --
+        # -- 4d: トレンド変化の検出 --
         if not message and trend_changed and trend_info["status"] != "neutral":
             message, ai_context = build_trend_message(trend_info, current_price)
 
-        # Step 4: 状態を更新（通知の有無に関わらず毎回更新）
-        update_prev_state(res["mean_price"], sup["mean_price"], current_zone, trend_info["status"])
+        # Step 5: 状態を更新（通知の有無に関わらず毎回更新）
+        update_prev_state(res_price, sup_price, current_price_zone, trend_info["status"])
 
-        # Step 5: メッセージ送信
+        # Step 6: メッセージ送信
         if message:
             if ai_context:
                 if trend_info["status"] != "neutral":
                     ai_context += f"\n【現在のトレンド】\n{trend_info['details']}\n"
 
-                full_ai_context = build_full_ai_context(df, current_price, [], ai_context)
+                full_ai_context = build_full_ai_context(df, current_price, zones, ai_context)
                 message += get_ai_analysis(full_ai_context)
 
             send_line_message(message)
