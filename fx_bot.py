@@ -101,7 +101,7 @@ def get_ai_analysis(market_context: str) -> str:
 """
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.0-flash',
             contents=prompt,
         )
         return f"\n\n🤖AIアナリストのひとこと:\n{response.text.strip()}"
