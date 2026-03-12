@@ -56,9 +56,7 @@ _last_notification_time = None  # 最後に通知を送信した時刻
 NOTIFICATION_COOLDOWN_MINUTES = 30  # 同種通知の最小間隔（分）
 
 # ===== 設定パラメータ =====
-SWING_WINDOW_MINOR = 5   # マイナースイング（トレンド判定・壁検出）の検出用（5本）
-ZONE_MAX_AGE_HOURS = 48  # 壁の有効期限（直近48時間以内に形成・反応したものだけ有効）
-ZONE_MERGE_DISTANCE = 0.15  # 壁のマージ距離（0.15円 = 15pips以内なら同一ゾーン）
+SWING_WINDOW_MINOR = 5   # マイナースイング（トレンド判定）の検出用（5本）
 
 # バックグラウンドスケジューラー
 _scheduler = None
@@ -135,33 +133,27 @@ def has_zone_changed(new_res_price: float, new_sup_price: float) -> bool:
 def get_price_zone(current_price: float, res_zone: dict, sup_zone: dict) -> str:
     """
     現在価格がどのゾーンにいるかを判定する。
-    res_zone, sup_zone は group_price_zones の出力形式（zone_price ベース）。
-    ゾーンの範囲はゾーン内の反応ポイントの min/max から判定する。
-    返り値: "above_res", "in_res", "middle", "in_sup", "below_sup", "range"
+    クラスタリングの出力（zone_max / zone_min）から範囲を取得する。
+    返り値: "in_res", "middle", "in_sup", "range"
     """
     if res_zone is None or sup_zone is None:
         return "middle"
 
-    # ゾーンの価格範囲を取得
-    res_prices = [p["price"] for p in res_zone.get("reactions", [])]
-    sup_prices = [p["price"] for p in sup_zone.get("reactions", [])]
-    
-    # フォールバック: reactions が空の場合は zone_price を使う
-    res_max = max(res_prices) if res_prices else res_zone["zone_price"]
-    res_min = min(res_prices) if res_prices else res_zone["zone_price"]
-    sup_max = max(sup_prices) if sup_prices else sup_zone["zone_price"]
-    sup_min = min(sup_prices) if sup_prices else sup_zone["zone_price"]
+    # ゾーンの価格範囲を取得（クラスタリング出力対応）
+    res_max = res_zone.get("zone_max", res_zone["zone_price"])
+    res_min = res_zone.get("zone_min", res_zone["zone_price"])
+    sup_max = sup_zone.get("zone_max", sup_zone["zone_price"])
+    sup_min = sup_zone.get("zone_min", sup_zone["zone_price"])
 
-    if current_price > res_max:
-        return "above_res"
-    elif res_min <= current_price <= res_max:
-        if sup_min <= current_price <= sup_max:
-            return "range"
+    in_res = res_min <= current_price <= res_max
+    in_sup = sup_min <= current_price <= sup_max
+
+    if in_res and in_sup:
+        return "range"
+    elif in_res:
         return "in_res"
-    elif sup_min <= current_price <= sup_max:
+    elif in_sup:
         return "in_sup"
-    elif current_price < sup_min:
-        return "below_sup"
     else:
         return "middle"
 
@@ -248,6 +240,35 @@ def detect_support_resistance(df: pd.DataFrame) -> dict:
     }
 
 
+def cluster_to_zone(cluster_info: dict, zone_type: str) -> dict:
+    """
+    detect_support_resistance()のクラスタリング出力を、
+    メッセージ生成関数が期待するゾーン辞書形式に変換するアダプター。
+    """
+    count = cluster_info["count"]
+    # データポイント数に基づく強さ（★〜★★★）
+    # High/Lowの合計なので、実足数は count/2 相当
+    candle_count = max(count // 2, 1)
+    stars = min(candle_count, 3)
+    if stars == 0:
+        stars = 1
+
+    return {
+        "zone_price": cluster_info["mean_price"],
+        "zone_max": cluster_info["max"],
+        "zone_min": cluster_info["min"],
+        "type": zone_type,
+        "reaction_count": candle_count,
+        "strength": stars,
+        "strength_str": "★" * stars,
+        "avg_wick_ratio": 0.0,
+        "reactions": [{"price": cluster_info["mean_price"],
+                       "timestamp": datetime.now(JST),
+                       "wick_ratio": 0.0,
+                       "type": zone_type}],
+    }
+
+
 # ===== ④ Stage 1: スイングポイント検出（プライスアクション） =====
 def detect_swing_points(df: pd.DataFrame, window: int):
     """
@@ -321,111 +342,6 @@ def detect_swing_points(df: pd.DataFrame, window: int):
             })
 
     return points
-
-
-# ===== ⑤ Stage 2: 壁のグループ化 + 反応回数カウント =====
-def group_price_zones(swing_points: list, merge_distance: float):
-    """
-    近い価格帯（merge_distance以内）のスイングポイントを1つのゾーンに統合する。
-    反応回数・ヒゲの質から強さ（★）を算出。
-    古い壁（ZONE_MAX_AGE_HOURS経過）は除外する。
-    """
-    if not swing_points:
-        return []
-
-    # --- 時間的減衰（賞味期限のフィルタリング） ---
-    now = datetime.now(JST)
-    valid_points = []
-    for p in swing_points:
-        ts = p["timestamp"]
-        if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-            ts = JST.localize(ts)
-        elif hasattr(ts, 'astimezone'):
-            ts = ts.astimezone(JST)
-            
-        if (now - ts).total_seconds() / 3600 <= ZONE_MAX_AGE_HOURS:
-            valid_points.append(p)
-            
-    if not valid_points:
-        return []
-
-    # 価格でソート
-    sorted_points = sorted(valid_points, key=lambda x: x["price"])
-
-    zones = []
-    current_zone = {
-        "points": [sorted_points[0]],
-        "type": sorted_points[0]["type"],
-    }
-
-    for point in sorted_points[1:]:
-        # 同じゾーン内（merge_distance以内）かつ同じタイプならマージ
-        zone_avg = sum(p["price"] for p in current_zone["points"]) / len(current_zone["points"])
-        if abs(point["price"] - zone_avg) <= merge_distance and point["type"] == current_zone["type"]:
-            current_zone["points"].append(point)
-        else:
-            zones.append(current_zone)
-            current_zone = {
-                "points": [point],
-                "type": point["type"],
-            }
-    zones.append(current_zone)
-
-    # ゾーンの統計情報を算出
-    result = []
-    for zone in zones:
-        pts = zone["points"]
-        reaction_count = len(pts)
-        avg_price = sum(p["price"] for p in pts) / reaction_count
-        avg_wick = sum(p["wick_ratio"] for p in pts) / reaction_count
-
-        # 強さ判定: 反応回数 + ヒゲの質
-        # 反応1回=★, 2回=★★, 3回以上=★★★
-        # ヒゲ比率が2.0以上なら+★（上限★★★）
-        stars = min(reaction_count, 3)
-        if avg_wick >= 2.0 and stars < 3:
-            stars += 1
-
-        # 反応履歴（新しい順）
-        reactions = sorted(pts, key=lambda x: x["timestamp"], reverse=True)
-
-        result.append({
-            "zone_price": round(avg_price, 3),
-            "type": zone["type"],
-            "reaction_count": reaction_count,
-            "strength": stars,
-            "strength_str": "★" * stars,
-            "avg_wick_ratio": round(avg_wick, 2),
-            "reactions": reactions,
-        })
-
-    return result
-
-
-def find_nearest_zones(zones: list, current_price: float) -> dict:
-    """
-    ゾーンリストから現在価格に最も近いレジスタンスとサポートを取得する。
-    - レジスタンス: 現在価格以上にあるゾーンのうち、最も近いもの
-    - サポート: 現在価格以下にあるゾーンのうち、最も近いもの
-    戻り値: {"resistance": zone_dict or None, "support": zone_dict or None}
-    """
-    res_zones = [z for z in zones if z["type"] == "resistance" and z["zone_price"] >= current_price]
-    sup_zones = [z for z in zones if z["type"] == "support" and z["zone_price"] <= current_price]
-
-    # 現在価格より上にレジスタンスがない場合、最も高いレジスタンスを使う
-    if not res_zones:
-        res_zones = [z for z in zones if z["type"] == "resistance"]
-    # 現在価格より下にサポートがない場合、最も低いサポートを使う
-    if not sup_zones:
-        sup_zones = [z for z in zones if z["type"] == "support"]
-
-    nearest_res = min(res_zones, key=lambda z: abs(z["zone_price"] - current_price)) if res_zones else None
-    nearest_sup = min(sup_zones, key=lambda z: abs(z["zone_price"] - current_price)) if sup_zones else None
-
-    return {
-        "resistance": nearest_res,
-        "support": nearest_sup,
-    }
 
 
 # ===== ⑤-B Stage 2.5: トレンド判定 (プライスアクション / ダウ理論) =====
@@ -554,55 +470,6 @@ def build_range_message(res_zone: dict, sup_zone: dict, current_price: float) ->
     return msg, ai_context
 
 
-# ===== ⑥-A2: ブレイクアウトメッセージ生成 =====
-def build_breakout_message(zone: dict, current_price: float, direction: str) -> tuple:
-    """
-    壁を突き抜けた場合のブレイクアウト通知メッセージを生成する。
-    direction: "up"（上方ブレイク）or "down"（下方ブレイク）
-    """
-    now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
-    zone_price = zone["zone_price"]
-    diff_pips = abs(current_price - zone_price) * 100
-
-    if direction == "up":
-        emoji = "🚀"
-        label = "上方ブレイクアウト"
-        wall_label = "天井（レジスタンス）"
-        action = "上昇トレンド加速の可能性があります"
-    else:
-        emoji = "💥"
-        label = "下方ブレイクアウト"
-        wall_label = "底（サポート）"
-        action = "下落トレンド加速の可能性があります"
-
-    msg = f"📊 ドル円アラート（{now_str}）\n\n"
-    msg += f"【{emoji}{label}】{zone_price:.2f}円の{wall_label}を突破！\n"
-    msg += f"　突破した壁の強さ: {zone['strength_str']}（過去{zone['reaction_count']}回反発していた壁）\n"
-    msg += f"　現在価格: {current_price:.2f}円（壁から{diff_pips:.0f}pips突破）\n"
-    msg += f"\n【根拠】\n"
-
-    # 過去の反応履歴（最大3件）
-    for reaction in zone["reactions"][:3]:
-        ts = reaction["timestamp"]
-        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
-            ts = ts.astimezone(JST)
-        if hasattr(ts, 'strftime'):
-            ts_str = ts.strftime("%m/%d %H:%M")
-        else:
-            ts_str = str(ts)[:16]
-        msg += f"・{ts_str} に{zone_price:.2f}円付近で反発していた\n"
-
-    msg += f"\n※{action}"
-
-    ai_context = (
-        f"現在価格{current_price:.2f}円。"
-        f"{zone_price:.2f}円の{wall_label}（{zone['strength_str']}、過去{zone['reaction_count']}回反発）を"
-        f"{diff_pips:.0f}pips突破した{label}が発生。"
-        f"トレンドの継続か、ダマシで戻るかの判断が重要。"
-    )
-
-    return msg, ai_context
-
 
 # ===== ⑥-C: トレンドメッセージ生成 (プライスアクション版) =====
 def build_trend_message(trend_info: dict, current_price: float) -> tuple:
@@ -719,28 +586,25 @@ def run_analysis_task(force: bool = False):
 
         print(f"現在価格: {current_price:.3f}円")
 
-        # ===== スイングポイントベース分析パイプライン =====
+        # ===== クラスタリングベース分析パイプライン =====
 
-        # Step 1: スイングポイント検出 → ゾーンのグルーピング
+        # Step 1: クラスタリングで天井/底を検出（直近8時間 = 32本）
+        df_recent = df.tail(32) if len(df) >= 32 else df
+        sr = detect_support_resistance(df_recent)
+        res_zone = cluster_to_zone(sr["resistance"], "resistance")
+        sup_zone = cluster_to_zone(sr["support"], "support")
+        zones = [res_zone, sup_zone]  # 全ゾーン一覧（AI分析向け）
+
+        # スイングポイントはトレンド判定（ダウ理論）専用
         swing_points = detect_swing_points(df, window=SWING_WINDOW_MINOR)
-        zones = group_price_zones(swing_points, merge_distance=ZONE_MERGE_DISTANCE)
-        nearest = find_nearest_zones(zones, current_price)
-        res_zone = nearest["resistance"]
-        sup_zone = nearest["support"]
-
-        # トレンド判定
         trend_info = analyze_trend_pa(swing_points)
 
-        print(f"  スイングポイント: {len(swing_points)}個検出")
-        print(f"  ゾーン: {len(zones)}個（有効期限{ZONE_MAX_AGE_HOURS}時間以内）")
-        if res_zone:
-            print(f"  最寄りレジスタンス: {res_zone['zone_price']:.3f}円 {res_zone['strength_str']}（{res_zone['reaction_count']}回反発）")
-        else:
-            print("  最寄りレジスタンス: なし")
-        if sup_zone:
-            print(f"  最寄りサポート: {sup_zone['zone_price']:.3f}円 {sup_zone['strength_str']}（{sup_zone['reaction_count']}回反発）")
-        else:
-            print("  最寄りサポート: なし")
+        optimal_k = sr.get("optimal_k", "?")
+        sil_score = sr.get("silhouette_score", "?")
+        print(f"  クラスタリング: k={optimal_k}, シルエットスコア={sil_score}")
+        print(f"  天井帯: {res_zone['zone_price']:.3f}円（{res_zone['zone_min']:.3f}〜{res_zone['zone_max']:.3f}）{res_zone['strength_str']}")
+        print(f"  底帯: {sup_zone['zone_price']:.3f}円（{sup_zone['zone_min']:.3f}〜{sup_zone['zone_max']:.3f}）{sup_zone['strength_str']}")
+        print(f"  スイングポイント: {len(swing_points)}個（トレンド判定用）")
 
         # --- 強制テスト通知 ---
         if force:
@@ -802,15 +666,8 @@ def run_analysis_task(force: bool = False):
 
         # Step 4: 変化があった場合のみアラート判定
         if zone_changed or zone_level_changed:
-            # -- 4a: ブレイクアウト（ゾーンが壁の外に遷移） --
-            if current_price_zone == "above_res" and prev_zone != "above_res" and res_zone:
-                message, ai_context = build_breakout_message(res_zone, current_price, "up")
-
-            elif current_price_zone == "below_sup" and prev_zone != "below_sup" and sup_zone:
-                message, ai_context = build_breakout_message(sup_zone, current_price, "down")
-
-            # -- 4b: 壁への接近（ゾーンに初めて入った） --
-            elif current_price_zone == "in_res" and res_zone:
+            # -- 4a: 壁への接近（ゾーンに初めて入った） --
+            if current_price_zone == "in_res" and res_zone:
                 if prev_zone != "in_res" or zone_level_changed:
                     message, ai_context = build_alert_message(res_zone, current_price, "resistance")
 
@@ -847,8 +704,8 @@ def run_analysis_task(force: bool = False):
         update_prev_state(res_price, sup_price, current_price_zone, trend_info["status"])
 
         # Step 6: メッセージ送信（クールダウンチェック付き）
-        # 重要な変化（壁レベル変化・ブレイクアウト・トレンド変化）はクールダウンをバイパス
-        is_important_change = zone_level_changed or trend_changed or current_price_zone in ("above_res", "below_sup")
+        # 重要な変化（壁レベル変化・トレンド変化）はクールダウンをバイパス
+        is_important_change = zone_level_changed or trend_changed
         global _last_notification_time
         if message:
             # クールダウンチェック: 重要な変化でない場合のみ適用
