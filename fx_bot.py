@@ -48,8 +48,12 @@ _prev_state = {
     "trend_status": None,      # 前回のトレンド状態 ("up", "down", "neutral")
 }
 
-# ゾーンの平均価格がこの割合以上変化したら「レベルが変わった」と判定
-ZONE_CHANGE_RATIO = 0.001  # 0.1%（例: 150円なら0.15円=15pips以上のシフト）
+# 壁レベル変化の丸め単位（この刻み以下の変動は無視）
+ZONE_QUANTIZE_STEP = 0.05  # 0.05円（5pips）単位で丸めて比較
+
+# 通知クールダウン管理
+_last_notification_time = None  # 最後に通知を送信した時刻
+NOTIFICATION_COOLDOWN_MINUTES = 30  # 同種通知の最小間隔（分）
 
 # ===== 設定パラメータ =====
 SWING_WINDOW_MINOR = 5   # マイナースイング（トレンド判定・壁検出）の検出用（5本）
@@ -112,16 +116,20 @@ def get_ai_analysis(market_context: str) -> str:
 def has_zone_changed(new_res_price: float, new_sup_price: float) -> bool:
     """
     前回と比較してゾーンのレベル（天井・底の平均価格）が有意に変化したか判定する。
+    ZONE_QUANTIZE_STEP（0.05円=5pips）単位で丸めてから比較し、微小変動を無視する。
     初回は常にTrue（まだデータがないため）。
     """
     if _prev_state["resistance_mean"] is None or _prev_state["support_mean"] is None:
         return True
 
-    # 前回の平均価格との相対変化率で判定（固定pips不使用）
-    res_change = abs(new_res_price - _prev_state["resistance_mean"]) / _prev_state["resistance_mean"]
-    sup_change = abs(new_sup_price - _prev_state["support_mean"]) / _prev_state["support_mean"]
+    # 0.05円単位で丸めてから比較（微小変動を無視）
+    q = ZONE_QUANTIZE_STEP
+    new_res_q = round(new_res_price / q) * q
+    old_res_q = round(_prev_state["resistance_mean"] / q) * q
+    new_sup_q = round(new_sup_price / q) * q
+    old_sup_q = round(_prev_state["support_mean"] / q) * q
 
-    return res_change >= ZONE_CHANGE_RATIO or sup_change >= ZONE_CHANGE_RATIO
+    return new_res_q != old_res_q or new_sup_q != old_sup_q
 
 
 def get_price_zone(current_price: float, res_zone: dict, sup_zone: dict) -> str:
@@ -783,6 +791,12 @@ def run_analysis_task(force: bool = False):
         print(f"  ゾーン: {prev_zone} → {current_price_zone} (変化: {zone_changed})")
         print(f"  壁レベル変化: {zone_level_changed}, トレンド変化: {trend_changed}")
 
+        # 初回実行時（Renderスリープ復帰含む）は通知をスキップし、状態の初期化のみ行う
+        if _prev_state["resistance_mean"] is None:
+            print("  初回実行のため、状態を初期化します（通知はスキップ）。")
+            update_prev_state(res_price, sup_price, current_price_zone, trend_info["status"])
+            return
+
         message = ""
         ai_context = ""
 
@@ -832,7 +846,20 @@ def run_analysis_task(force: bool = False):
         # Step 5: 状態を更新（通知の有無に関わらず毎回更新）
         update_prev_state(res_price, sup_price, current_price_zone, trend_info["status"])
 
-        # Step 6: メッセージ送信
+        # Step 6: メッセージ送信（クールダウンチェック付き）
+        # 重要な変化（壁レベル変化・ブレイクアウト・トレンド変化）はクールダウンをバイパス
+        is_important_change = zone_level_changed or trend_changed or current_price_zone in ("above_res", "below_sup")
+        global _last_notification_time
+        if message:
+            # クールダウンチェック: 重要な変化でない場合のみ適用
+            if not is_important_change:
+                now = datetime.now(JST)
+                if _last_notification_time is not None:
+                    elapsed = (now - _last_notification_time).total_seconds() / 60
+                    if elapsed < NOTIFICATION_COOLDOWN_MINUTES:
+                        print(f"  クールダウン中（前回通知から{elapsed:.0f}分経過、{NOTIFICATION_COOLDOWN_MINUTES}分必要）。通知をスキップします。")
+                        message = ""
+
         if message:
             if ai_context:
                 if trend_info["status"] != "neutral":
@@ -842,6 +869,7 @@ def run_analysis_task(force: bool = False):
                 message += get_ai_analysis(full_ai_context)
 
             send_line_message(message)
+            _last_notification_time = datetime.now(JST)
             print("通知を送信しました:\n" + message)
         else:
             print("変化なし。通知不要です。")
